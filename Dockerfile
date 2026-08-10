@@ -66,11 +66,11 @@ RUN python3 -m venv /opt/venv \
     && python -m pip check
 
 WORKDIR /app
-COPY go2w_height_sequence_real.py /app/go2w_height_sequence_real.py
+COPY go2w_gesture_real.py /app/go2w_gesture_real.py
 COPY tests /app/tests
 
 RUN python -m unittest discover -s /app/tests -v \
-    && python /app/go2w_height_sequence_real.py --describe
+    && python /app/go2w_gesture_real.py --describe
 
 
 FROM ubuntu:22.04 AS runtime
@@ -79,9 +79,9 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG CYCLONEDDS_COMMIT=1be07de395e4ddf969db2b90328cdf4fb73e9a64
 ARG UNITREE_SDK2_PYTHON_COMMIT=a035adeaa6f8ea171bef9a43e8477abb87a0b35e
 
-LABEL org.opencontainers.image.title="Go2W low-level height sequence" \
-      org.opencontainers.image.description="Fail-closed Unitree Go2W hardware height sequence using SDK2Py" \
-      org.opencontainers.image.source="https://github.com/koki67/go2w-height-sequence" \
+LABEL org.opencontainers.image.title="Go2W low-level gestures" \
+      org.opencontainers.image.description="Fail-closed Unitree Go2W hardware gestures using SDK2Py" \
+      org.opencontainers.image.source="https://github.com/koki67/go2w-lowlevel-gestures" \
       org.opencontainers.image.licenses="MIT" \
       io.unitree.sdk2-python.commit="${UNITREE_SDK2_PYTHON_COMMIT}" \
       io.cyclonedds.commit="${CYCLONEDDS_COMMIT}"
@@ -114,5 +114,5 @@ COPY --from=builder --chown=controller:controller /app /app
 USER controller
 WORKDIR /app
 
-ENTRYPOINT ["/opt/venv/bin/python", "/app/go2w_height_sequence_real.py"]
+ENTRYPOINT ["/opt/venv/bin/python", "/app/go2w_gesture_real.py"]
 CMD []

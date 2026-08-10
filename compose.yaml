@@ -1,8 +1,8 @@
-name: go2w-height-sequence
+name: go2w-lowlevel-gestures
 
 services:
   controller:
-    image: go2w-height-sequence:local
+    image: go2w-lowlevel-gestures:local
     build:
       context: .
       dockerfile: Dockerfile
