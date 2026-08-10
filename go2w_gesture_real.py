@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Go2W height sequence on hardware through Unitree SDK2Py.
+"""Run selected Go2W low-level gestures on hardware through Unitree SDK2Py.
 
 The default invocation is a read-only preflight. Physical motion requires the
 explicit ``--live`` flag and a confirmation phrase entered on a TTY.
@@ -44,6 +44,10 @@ HEIGHT_HOLD_S = 0.5
 PRONE_HOLD_S = 2.0
 NEUTRAL_COMMAND_S = 1.0
 HEIGHT_CYCLES = 3
+ROLL_TRANSITION_S = 0.75
+ROLL_HOLD_S = 0.5
+ROLL_CYCLES = 3
+ROLL_LIMIT_SCALE = 0.70
 
 LOWSTATE_STARTUP_TIMEOUT_S = 10.0
 LOWSTATE_TIMEOUT_S = 0.10
@@ -62,7 +66,11 @@ MODE_RELEASE_TIMEOUT_S = 10.0
 
 POS_STOP_F = 2.146e9
 VEL_STOP_F = 16000.0
-LIVE_CONFIRMATION = "RUN GO2W LOW LEVEL"
+GESTURE_NAMES = ("height", "roll")
+LIVE_CONFIRMATIONS = {
+    "height": "RUN GO2W LOW LEVEL",
+    "roll": "RUN GO2W ROLL LOW LEVEL",
+}
 
 KP = [60.0, 80.0, 80.0] * 4
 KD = [5.0, 4.0, 4.0] * 4
@@ -90,6 +98,33 @@ STANDARD = symmetric_pose(0.10, 0.90, -1.80)
 LOW = symmetric_pose(0.10, 1.15, -2.30)
 HIGH = symmetric_pose(0.10, 0.65, -1.30)
 CALF_INDICES = (2, 5, 8, 11)
+HIP_INDICES = (0, 3, 6, 9)
+
+# Unitree Go2W URDF limits for FR/FL/RR/RL hip abduction.  These values were
+# cross-checked against the MuJoCo go2w.xml model used to qualify this gesture.
+HIP_LIMIT_LOWER_RAD = -1.0472
+HIP_LIMIT_UPPER_RAD = 1.0472
+
+
+def make_roll_targets():
+    positive_margin = min(
+        HIP_LIMIT_UPPER_RAD - STANDARD[index] for index in HIP_INDICES
+    )
+    negative_margin = min(
+        STANDARD[index] - HIP_LIMIT_LOWER_RAD for index in HIP_INDICES
+    )
+    theoretical_limit = min(positive_margin, negative_margin)
+    amplitude = theoretical_limit * ROLL_LIMIT_SCALE
+
+    right = list(STANDARD)
+    left = list(STANDARD)
+    for index in HIP_INDICES:
+        right[index] -= amplitude
+        left[index] += amplitude
+    return amplitude, right, left
+
+
+ROLL_AMPLITUDE_RAD, ROLL_RIGHT, ROLL_LEFT = make_roll_targets()
 
 
 # SDK symbols are loaded after argument parsing so --help and --describe work
@@ -184,19 +219,60 @@ def interpolate(source, target, alpha):
     ]
 
 
-def print_sequence_plan():
-    print("Go2W real-robot sequence:")
+def print_common_shutdown_plan():
+    print("  hold standard: {:.1f} s".format(STANDARD_HOLD_S))
+    print("  standard -> captured prone: {:.1f} s".format(PRONE_TRANSITION_S))
+    print("  hold prone: {:.1f} s".format(PRONE_HOLD_S))
+    print("  neutral zero-gain command: {:.1f} s, then stop LowCmd".format(NEUTRAL_COMMAND_S))
+    print("  Sport Mode is not reactivated automatically")
+
+
+def print_height_plan():
+    print("Go2W real-robot gesture: height")
     print("  captured prone -> standard: {:.1f} s".format(STANDARD_TRANSITION_S))
     print("  hold standard: {:.1f} s".format(STANDARD_HOLD_S))
     print("  repeat {} times:".format(HEIGHT_CYCLES))
     print("    -> low: {:.1f} s, hold {:.1f} s".format(HEIGHT_TRANSITION_S, HEIGHT_HOLD_S))
     print("    -> high: {:.1f} s, hold {:.1f} s".format(HEIGHT_TRANSITION_S, HEIGHT_HOLD_S))
     print("  high -> standard: {:.1f} s".format(STANDARD_TRANSITION_S))
+    print_common_shutdown_plan()
+
+
+def print_roll_plan():
+    print("Go2W real-robot gesture: roll")
+    print("  captured prone -> standard: {:.1f} s".format(STANDARD_TRANSITION_S))
     print("  hold standard: {:.1f} s".format(STANDARD_HOLD_S))
-    print("  standard -> captured prone: {:.1f} s".format(PRONE_TRANSITION_S))
-    print("  hold prone: {:.1f} s".format(PRONE_HOLD_S))
-    print("  neutral zero-gain command: {:.1f} s, then stop LowCmd".format(NEUTRAL_COMMAND_S))
-    print("  Sport Mode is not reactivated automatically")
+    print(
+        "  common hip offset: +/-{:.5f} rad ({:.0%} of URDF-derived limit)".format(
+            ROLL_AMPLITUDE_RAD, ROLL_LIMIT_SCALE
+        )
+    )
+    print("  repeat {} times:".format(ROLL_CYCLES))
+    print(
+        "    -> right: {:g} s, hold {:.1f} s".format(
+            ROLL_TRANSITION_S, ROLL_HOLD_S
+        )
+    )
+    print(
+        "    -> left: {:g} s, hold {:.1f} s".format(
+            ROLL_TRANSITION_S, ROLL_HOLD_S
+        )
+    )
+    print("  left -> standard: {:.1f} s".format(STANDARD_TRANSITION_S))
+    print_common_shutdown_plan()
+
+
+def print_sequence_plan(gesture=None):
+    if gesture is None:
+        print_height_plan()
+        print("")
+        print_roll_plan()
+    elif gesture == "height":
+        print_height_plan()
+    elif gesture == "roll":
+        print_roll_plan()
+    else:
+        raise ValueError("unknown gesture: {!r}".format(gesture))
 
 
 @dataclass
@@ -216,10 +292,13 @@ class HardStop(Exception):
     pass
 
 
-class HardwareSequenceController:
-    def __init__(self, interface, expected_ip):
+class HardwareGestureController:
+    def __init__(self, interface, expected_ip, gesture):
+        if gesture not in GESTURE_NAMES:
+            raise ValueError("unknown gesture: {!r}".format(gesture))
         self.interface = interface
         self.expected_ip = expected_ip
+        self.gesture = gesture
         self._lock = threading.Lock()
         self._samples = deque(maxlen=2000)
         self._last_lowcmd_time = None  # type: Optional[float]
@@ -555,7 +634,7 @@ class HardwareSequenceController:
         duration_s,
         ignore_first_stop=False,
     ):
-        print("transition -> {} ({:.1f} s)".format(name, duration_s), flush=True)
+        print("transition -> {} ({:g} s)".format(name, duration_s), flush=True)
         return self._run_for(
             duration_s,
             lambda alpha: interpolate(source, target, alpha),
@@ -619,6 +698,45 @@ class HardwareSequenceController:
             STANDARD_TRANSITION_S,
         )
         self._hold("standard", STANDARD, STANDARD_HOLD_S)
+        self._finish_at_captured_prone(current_pose)
+
+    def _run_roll_sequence(self):
+        current_pose = list(self._latest_sample().pose)
+        current_pose = self._transition(
+            "standard",
+            current_pose,
+            STANDARD,
+            STANDARD_TRANSITION_S,
+        )
+        self._hold("standard", STANDARD, STANDARD_HOLD_S)
+
+        for cycle in range(1, ROLL_CYCLES + 1):
+            print("roll cycle {}/{}".format(cycle, ROLL_CYCLES), flush=True)
+            current_pose = self._transition(
+                "right roll",
+                current_pose,
+                ROLL_RIGHT,
+                ROLL_TRANSITION_S,
+            )
+            self._hold("right roll", ROLL_RIGHT, ROLL_HOLD_S)
+            current_pose = self._transition(
+                "left roll",
+                current_pose,
+                ROLL_LEFT,
+                ROLL_TRANSITION_S,
+            )
+            self._hold("left roll", ROLL_LEFT, ROLL_HOLD_S)
+
+        current_pose = self._transition(
+            "standard",
+            current_pose,
+            STANDARD,
+            STANDARD_TRANSITION_S,
+        )
+        self._hold("standard", STANDARD, STANDARD_HOLD_S)
+        self._finish_at_captured_prone(current_pose)
+
+    def _finish_at_captured_prone(self, current_pose):
         self._transition(
             "captured prone",
             current_pose,
@@ -628,6 +746,14 @@ class HardwareSequenceController:
         self._hold("captured prone", self._captured_prone, PRONE_HOLD_S)
         self._ended_prone = True
         self._neutralize(NEUTRAL_COMMAND_S)
+
+    def _run_selected_gesture(self):
+        if self.gesture == "height":
+            self._run_height_sequence()
+        elif self.gesture == "roll":
+            self._run_roll_sequence()
+        else:
+            raise RuntimeError("unsupported gesture: {!r}".format(self.gesture))
 
     def _return_prone_after_interrupt(self):
         if self._publisher is None or self._captured_prone is None:
@@ -686,6 +812,7 @@ class HardwareSequenceController:
         if not sys.stdin.isatty():
             raise RuntimeError("--live requires an interactive TTY confirmation")
         print("\nLIVE HARDWARE PRECHECK PASSED", flush=True)
+        print("  selected gesture: {}".format(self.gesture), flush=True)
         print("  NIC: {} = {}".format(self.interface, self.expected_ip), flush=True)
         print(
             "  active motion service: form={!r}, name={!r}".format(
@@ -710,8 +837,11 @@ class HardwareSequenceController:
             "a support/spotter is present, and the hardware E-stop is held ready.",
             flush=True,
         )
-        entered = input("Type {!r} to release Sport Mode and move: ".format(LIVE_CONFIRMATION))
-        if entered.strip() != LIVE_CONFIRMATION:
+        confirmation = LIVE_CONFIRMATIONS[self.gesture]
+        entered = input(
+            "Type {!r} to release Sport Mode and move: ".format(confirmation)
+        )
+        if entered.strip() != confirmation:
             raise RuntimeError("live confirmation did not match; no mode was released")
         if self._stop_requested.is_set():
             raise InterruptedSequence()
@@ -725,8 +855,22 @@ class HardwareSequenceController:
                 )
             )
 
-        for name, pose in (("STANDARD", STANDARD), ("LOW", LOW), ("HIGH", HIGH)):
+        for name, pose in (
+            ("STANDARD", STANDARD),
+            ("LOW", LOW),
+            ("HIGH", HIGH),
+            ("ROLL_RIGHT", ROLL_RIGHT),
+            ("ROLL_LEFT", ROLL_LEFT),
+        ):
             validate_pose_values(name, pose)
+        for name, pose in (("ROLL_RIGHT", ROLL_RIGHT), ("ROLL_LEFT", ROLL_LEFT)):
+            for index in HIP_INDICES:
+                if not HIP_LIMIT_LOWER_RAD <= pose[index] <= HIP_LIMIT_UPPER_RAD:
+                    raise RuntimeError(
+                        "{} hip target exceeds URDF limit at motor {}".format(
+                            name, index
+                        )
+                    )
 
         print(
             "network preflight passed: {} = {}, DDS domain {}".format(
@@ -739,7 +883,7 @@ class HardwareSequenceController:
         mode_form, mode_name = self._check_mode()
         prone_pose, rpy = self._capture_stable_prone()
 
-        print_sequence_plan()
+        print_sequence_plan(self.gesture)
         print(
             "read-only preflight: form={!r}, active mode={!r}, stable prone pose confirmed".format(
                 mode_form, mode_name
@@ -776,7 +920,7 @@ class HardwareSequenceController:
         self._publishing = True
 
         try:
-            self._run_height_sequence()
+            self._run_selected_gesture()
         except InterruptedSequence:
             self._return_prone_after_interrupt()
             self._neutralize(NEUTRAL_COMMAND_S)
@@ -814,9 +958,15 @@ class HardwareSequenceController:
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
-            "Go2W real-hardware height sequence. Default is a read-only preflight; "
-            "physical motion requires --live plus an interactive confirmation."
+            "Go2W real-hardware low-level gestures. Default execution is a "
+            "read-only preflight; physical motion requires --live plus an "
+            "interactive gesture-specific confirmation."
         )
+    )
+    parser.add_argument(
+        "--gesture",
+        choices=GESTURE_NAMES,
+        help="gesture to preflight or execute (required unless --describe is used)",
     )
     parser.add_argument(
         "--interface",
@@ -844,13 +994,24 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.describe:
-        print_sequence_plan()
+        print_sequence_plan(args.gesture)
         return 0
+    if args.gesture is None:
+        print(
+            "error: --gesture is required for preflight or live execution",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
 
     controller = None
     try:
         load_unitree_sdk()
-        controller = HardwareSequenceController(args.interface, args.expected_ip)
+        controller = HardwareGestureController(
+            args.interface,
+            args.expected_ip,
+            args.gesture,
+        )
         signal.signal(signal.SIGINT, controller.request_stop)
         signal.signal(signal.SIGTERM, controller.request_stop)
         controller.run(live=args.live)
