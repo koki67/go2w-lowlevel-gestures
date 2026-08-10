@@ -1,0 +1,22 @@
+name: go2w-height-sequence
+
+services:
+  controller:
+    image: go2w-height-sequence:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CYCLONEDDS_COMMIT: 1be07de395e4ddf969db2b90328cdf4fb73e9a64
+        UNITREE_SDK2_PYTHON_COMMIT: a035adeaa6f8ea171bef9a43e8477abb87a0b35e
+    network_mode: host
+    init: true
+    stdin_open: true
+    tty: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    stop_signal: SIGINT
+    stop_grace_period: 15s
