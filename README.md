@@ -4,12 +4,19 @@ Containerized, fail-closed low-level gesture controller for a Unitree Go2W.
 The controller talks directly to Unitree SDK2Py over CycloneDDS. It does not
 use `rclpy`, Unitree ROS 2 messages, ROS 2 Foxy, or ROS 2 Humble at runtime.
 
-The repository currently provides two selectable gestures:
+The repository provides two selectable gestures and two explicit hardware
+timing scripts. Both scripts import the same fail-closed controller logic; only
+the repeated gesture transition/hold timing differs.
 
 | Gesture | Low-level sequence |
 | --- | --- |
 | `height` | Standard, three low/high cycles, standard |
 | `roll` | Standard, three right/left cycles, standard |
+
+| Script | Timing profile | Gesture transition | Gesture hold |
+| --- | --- | --- | --- |
+| `go2w_gesture_real.py` | `slow` | 2.0 s | 2.0 s |
+| `go2w_gesture_real_legacy.py` | `legacy` | 1.0 s | 0.5 s |
 
 Every live gesture shares the same control-ownership checks, watchdogs,
 captured-prone shutdown, and explicit confirmation boundary.
@@ -25,6 +32,7 @@ make describe
 ```
 
 `make build`, `make test`, and `make describe` do not connect to the robot.
+`make describe` prints both timing profiles.
 
 ## Deployment assumptions
 
@@ -44,10 +52,16 @@ but sourcing a ROS environment is not required.
 
 ## Gesture definitions
 
+The profile timing applies to the repeated low/high or right/left motions. Both
+scripts retain the safer common startup and shutdown timing: captured prone to
+standard is 2.0 s with a 2.0 s hold, standard recovery is 2.0 s with a 2.0 s
+hold, and return to captured prone is 3.0 s with a 2.0 s hold.
+
 ### Height
 
 - Captured prone to standard: 2.0 s; hold standard: 2.0 s.
-- Three low/high cycles, each transition 2.0 s and hold 2.0 s.
+- Three low/high cycles using the selected profile timing: slow `2.0/2.0 s` or
+  legacy `1.0/0.5 s` transition/hold.
 - High to standard: 2.0 s; hold standard: 2.0 s.
 - Standard to captured prone: 3.0 s; hold prone: 2.0 s.
 - Zero-gain neutral command: 1.0 s, then stop LowCmd.
@@ -60,7 +74,8 @@ The roll gesture deliberately uses 70% of that value: `0.66304 rad` (about
 38.0 degrees of joint offset).
 
 - Captured prone to standard: 2.0 s; hold standard: 2.0 s.
-- Three right/left cycles, each transition 2.0 s and hold 2.0 s.
+- Three right/left cycles using the selected profile timing: slow `2.0/2.0 s`
+  or legacy `1.0/0.5 s` transition/hold.
 - Left to standard: 2.0 s; hold standard: 2.0 s.
 - Standard to captured prone: 3.0 s; hold prone: 2.0 s.
 - Zero-gain neutral command: 1.0 s, then stop LowCmd.
@@ -77,12 +92,22 @@ First verify the host NIC:
 ip -4 addr show dev eth0
 ```
 
-Then select the gesture to inspect:
+Then select the timing profile and gesture to inspect. Slow profile:
 
 ```bash
-make preflight-height
-make preflight-roll
+make preflight-slow-height
+make preflight-slow-roll
 ```
+
+Legacy profile:
+
+```bash
+make preflight-legacy-height
+make preflight-legacy-roll
+```
+
+The existing `make preflight-height` and `make preflight-roll` names remain
+aliases for the slow profile.
 
 Preflight initializes DDS, reads `rt/lowstate`, and calls read-only
 `CheckMode()`. It verifies the expected NIC/IP, stable prone pose, joint and
@@ -95,25 +120,28 @@ It does **not** call `StopMove()`, `ReleaseMode()`, `SelectMode()`, or publish
 Do not continue unless the selected preflight succeeds and the physical safety
 setup is ready.
 
-Height gesture:
+Slow height and roll gestures:
 
 ```bash
-make live-height
+make live-slow-height
+make live-slow-roll
 ```
 
-Required typed confirmation:
+Legacy height and roll gestures:
+
+```bash
+make live-legacy-height
+make live-legacy-roll
+```
+
+The required typed confirmation depends on the gesture, not the timing
+profile. Height:
 
 ```text
 RUN GO2W LOW LEVEL
 ```
 
-Roll gesture:
-
-```bash
-make live-roll
-```
-
-Required typed confirmation:
+Roll:
 
 ```text
 RUN GO2W ROLL LOW LEVEL
@@ -153,7 +181,7 @@ The live controller fails closed on:
 
 - stale or non-finite LowState;
 - body roll/pitch above `0.55 rad` (about 31.5 degrees);
-- leg-joint tracking error above `0.45 rad`;
+- any of the 12 position-controlled leg-joint tracking errors above `0.45 rad`;
 - DDS write failure;
 - failure to release Sport Mode;
 - LowCmd traffic that does not become quiet after release;
@@ -161,10 +189,23 @@ The live controller fails closed on:
 - unstable or implausible initial prone pose;
 - an unknown or omitted gesture.
 
+The `0.45 rad` joint-tracking threshold is a provisional heuristic introduced
+with the first hardware script. It was not derived from measured Go2W tracking
+error distributions, actuator/torque limits, or a physically qualified safety
+test. Do not treat it as a certified limit. Raising it allows larger
+commanded-versus-measured angle errors, larger potential PD effort and contact
+loads, and a longer loss-of-tracking interval before LowCmd is neutralized.
+
 The first Ctrl+C requests a controlled return to the captured prone pose. A
 second Ctrl+C abandons that return and sends a short neutral command. A process
 kill, host failure, container failure, or network loss can still prevent any
 software fallback. Physical support and a hardware E-stop remain mandatory.
+
+On a tracking-watchdog stop, the terminal reports every leg joint above the
+limit with its motor/q index, name, measured angle, commanded angle, signed
+`commanded-measured` error, and absolute error. Wheel motors 12--15 are not part
+of this position-tracking check because they receive velocity commands rather
+than position targets.
 
 ## Pinned dependencies
 
@@ -192,10 +233,11 @@ hierarchy; the checkout itself is not patched.
 - Height MuJoCo motion: validated separately.
 - Roll MuJoCo motion: validated at 70% URDF-derived hip offset and 0.75 s
   transitions.
-- Jetson `aarch64` image build and 500 Hz timing: not yet measured.
-- Go2W height hardware motion: one live attempt reached the first low-to-high
-  transition, then stopped on the `0.45 rad` joint-tracking watchdog; the full
-  sequence remains unqualified.
+- Jetson `aarch64` image build and live startup: exercised; actual 500 Hz loop
+  rate and jitter remain unmeasured.
+- Go2W height hardware motion: both legacy `1.0/0.5 s` and slow `2.0/2.0 s`
+  live attempts stopped on the provisional `0.45 rad` joint-tracking watchdog;
+  the full sequence remains unqualified.
 - Go2W roll hardware motion: not yet performed.
 - Automatic Sport Mode restoration: intentionally not implemented.
 

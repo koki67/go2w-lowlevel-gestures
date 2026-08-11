@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run selected Go2W low-level gestures on hardware through Unitree SDK2Py.
+"""Run slow-profile Go2W low-level gestures through Unitree SDK2Py.
 
 The default invocation is a read-only preflight. Physical motion requires the
 explicit ``--live`` flag and a confirmation phrase entered on a TTY.
@@ -37,15 +37,11 @@ DEFAULT_EXPECTED_IP = "192.168.123.18"
 
 CONTROL_PERIOD_S = 0.002  # 500 Hz
 STANDARD_TRANSITION_S = 2.0
-HEIGHT_TRANSITION_S = 2.0
 PRONE_TRANSITION_S = 3.0
 STANDARD_HOLD_S = 2.0
-HEIGHT_HOLD_S = 2.0
 PRONE_HOLD_S = 2.0
 NEUTRAL_COMMAND_S = 1.0
 HEIGHT_CYCLES = 3
-ROLL_TRANSITION_S = 2.0
-ROLL_HOLD_S = 2.0
 ROLL_CYCLES = 3
 ROLL_LIMIT_SCALE = 0.70
 
@@ -59,6 +55,8 @@ PRONE_MAX_WHEEL_SPEED_RAD_S = 0.50
 PRONE_MAX_TILT_RAD = 0.35
 PRONE_MAX_CALF_ANGLE_RAD = -2.20
 RUN_MAX_TILT_RAD = 0.55
+# Provisional fail-closed heuristic. This value was not derived from measured
+# hardware tracking distributions, actuator limits, or a qualified torque bound.
 RUN_MAX_TRACKING_ERROR_RAD = 0.45
 LOWCMD_QUIET_S = 0.5
 LOWCMD_QUIET_TIMEOUT_S = 3.0
@@ -72,8 +70,41 @@ LIVE_CONFIRMATIONS = {
     "roll": "RUN GO2W ROLL LOW LEVEL",
 }
 
+
+@dataclass(frozen=True)
+class GestureTimingProfile:
+    name: str
+    transition_s: float
+    hold_s: float
+
+
+SLOW_TIMING = GestureTimingProfile(
+    name="slow",
+    transition_s=2.0,
+    hold_s=2.0,
+)
+LEGACY_TIMING = GestureTimingProfile(
+    name="legacy",
+    transition_s=1.0,
+    hold_s=0.5,
+)
+
 KP = [60.0, 80.0, 80.0] * 4
 KD = [5.0, 4.0, 4.0] * 4
+LEG_JOINT_NAMES = (
+    "FR_hip",
+    "FR_thigh",
+    "FR_calf",
+    "FL_hip",
+    "FL_thigh",
+    "FL_calf",
+    "RR_hip",
+    "RR_thigh",
+    "RR_calf",
+    "RL_hip",
+    "RL_thigh",
+    "RL_calf",
+)
 
 
 def symmetric_pose(hip, thigh, calf):
@@ -227,19 +258,29 @@ def print_common_shutdown_plan():
     print("  Sport Mode is not reactivated automatically")
 
 
-def print_height_plan():
+def print_height_plan(timing=SLOW_TIMING):
     print("Go2W real-robot gesture: height")
+    print("  timing profile: {}".format(timing.name))
     print("  captured prone -> standard: {:.1f} s".format(STANDARD_TRANSITION_S))
     print("  hold standard: {:.1f} s".format(STANDARD_HOLD_S))
     print("  repeat {} times:".format(HEIGHT_CYCLES))
-    print("    -> low: {:.1f} s, hold {:.1f} s".format(HEIGHT_TRANSITION_S, HEIGHT_HOLD_S))
-    print("    -> high: {:.1f} s, hold {:.1f} s".format(HEIGHT_TRANSITION_S, HEIGHT_HOLD_S))
+    print(
+        "    -> low: {:.1f} s, hold {:.1f} s".format(
+            timing.transition_s, timing.hold_s
+        )
+    )
+    print(
+        "    -> high: {:.1f} s, hold {:.1f} s".format(
+            timing.transition_s, timing.hold_s
+        )
+    )
     print("  high -> standard: {:.1f} s".format(STANDARD_TRANSITION_S))
     print_common_shutdown_plan()
 
 
-def print_roll_plan():
+def print_roll_plan(timing=SLOW_TIMING):
     print("Go2W real-robot gesture: roll")
+    print("  timing profile: {}".format(timing.name))
     print("  captured prone -> standard: {:.1f} s".format(STANDARD_TRANSITION_S))
     print("  hold standard: {:.1f} s".format(STANDARD_HOLD_S))
     print(
@@ -250,27 +291,27 @@ def print_roll_plan():
     print("  repeat {} times:".format(ROLL_CYCLES))
     print(
         "    -> right: {:g} s, hold {:.1f} s".format(
-            ROLL_TRANSITION_S, ROLL_HOLD_S
+            timing.transition_s, timing.hold_s
         )
     )
     print(
         "    -> left: {:g} s, hold {:.1f} s".format(
-            ROLL_TRANSITION_S, ROLL_HOLD_S
+            timing.transition_s, timing.hold_s
         )
     )
     print("  left -> standard: {:.1f} s".format(STANDARD_TRANSITION_S))
     print_common_shutdown_plan()
 
 
-def print_sequence_plan(gesture=None):
+def print_sequence_plan(gesture=None, timing=SLOW_TIMING):
     if gesture is None:
-        print_height_plan()
+        print_height_plan(timing)
         print("")
-        print_roll_plan()
+        print_roll_plan(timing)
     elif gesture == "height":
-        print_height_plan()
+        print_height_plan(timing)
     elif gesture == "roll":
-        print_roll_plan()
+        print_roll_plan(timing)
     else:
         raise ValueError("unknown gesture: {!r}".format(gesture))
 
@@ -293,12 +334,15 @@ class HardStop(Exception):
 
 
 class HardwareGestureController:
-    def __init__(self, interface, expected_ip, gesture):
+    def __init__(self, interface, expected_ip, gesture, timing=SLOW_TIMING):
         if gesture not in GESTURE_NAMES:
             raise ValueError("unknown gesture: {!r}".format(gesture))
+        if not isinstance(timing, GestureTimingProfile):
+            raise ValueError("invalid timing profile: {!r}".format(timing))
         self.interface = interface
         self.expected_ip = expected_ip
         self.gesture = gesture
+        self.timing = timing
         self._lock = threading.Lock()
         self._samples = deque(maxlen=2000)
         self._last_lowcmd_time = None  # type: Optional[float]
@@ -570,7 +614,13 @@ class HardwareGestureController:
             "rt/lowcmd did not become quiet after ReleaseMode; another command writer may be active"
         )
 
-    def _check_runtime(self, commanded_pose, ignore_first_stop=False):
+    def _check_runtime(
+        self,
+        commanded_pose,
+        ignore_first_stop=False,
+        motion_context=None,
+        motion_elapsed_s=None,
+    ):
         if self._hard_stop_requested.is_set():
             raise HardStop()
         if self._stop_requested.is_set() and not ignore_first_stop:
@@ -594,24 +644,75 @@ class HardwareGestureController:
             )
 
         if commanded_pose is not None:
-            tracking_error = max(
-                abs(sample.pose[index] - commanded_pose[index]) for index in range(12)
-            )
-            if tracking_error > RUN_MAX_TRACKING_ERROR_RAD:
-                raise RuntimeError(
-                    "joint tracking watchdog triggered: {:.3f} rad > {:.3f} rad".format(
-                        tracking_error, RUN_MAX_TRACKING_ERROR_RAD
-                    )
+            signed_errors = [
+                commanded_pose[index] - sample.pose[index] for index in range(12)
+            ]
+            exceeded_indices = [
+                index
+                for index, error in enumerate(signed_errors)
+                if abs(error) > RUN_MAX_TRACKING_ERROR_RAD
+            ]
+            if exceeded_indices:
+                max_index = max(
+                    range(12), key=lambda index: abs(signed_errors[index])
                 )
+                context_text = ""
+                if motion_context is not None:
+                    context_text = " during {}".format(motion_context)
+                    if motion_elapsed_s is not None:
+                        context_text += " at {:.3f} s".format(motion_elapsed_s)
+                lines = [
+                    (
+                        "joint tracking watchdog triggered: {}/12 leg joints "
+                        "exceeded the limit{}; max_abs_error={:.9f} rad at "
+                        "motor[{}]/q[{}] {} > limit={:.9f} rad"
+                    ).format(
+                        len(exceeded_indices),
+                        context_text,
+                        abs(signed_errors[max_index]),
+                        max_index,
+                        max_index,
+                        LEG_JOINT_NAMES[max_index],
+                        RUN_MAX_TRACKING_ERROR_RAD,
+                    )
+                ]
+                for index in exceeded_indices:
+                    lines.append(
+                        (
+                            "  motor[{0}]/q[{0}] {1}: measured={2:+.6f} rad, "
+                            "commanded={3:+.6f} rad, "
+                            "commanded-measured={4:+.9f} rad, "
+                            "abs_error={5:.9f} rad"
+                        ).format(
+                            index,
+                            LEG_JOINT_NAMES[index],
+                            sample.pose[index],
+                            commanded_pose[index],
+                            signed_errors[index],
+                            abs(signed_errors[index]),
+                        )
+                    )
+                raise RuntimeError("\n".join(lines))
         return sample
 
-    def _run_for(self, duration_s, pose_at, ignore_first_stop=False):
+    def _run_for(
+        self,
+        duration_s,
+        pose_at,
+        ignore_first_stop=False,
+        motion_context=None,
+    ):
         start = time.monotonic()
         next_tick = start
         last_pose = list(pose_at(0.0))
         while True:
-            self._check_runtime(last_pose, ignore_first_stop=ignore_first_stop)
             elapsed = time.monotonic() - start
+            self._check_runtime(
+                last_pose,
+                ignore_first_stop=ignore_first_stop,
+                motion_context=motion_context,
+                motion_elapsed_s=elapsed,
+            )
             alpha = min(1.0, elapsed / duration_s)
             last_pose = list(pose_at(alpha))
             self._write_pose(last_pose)
@@ -639,6 +740,7 @@ class HardwareGestureController:
             duration_s,
             lambda alpha: interpolate(source, target, alpha),
             ignore_first_stop=ignore_first_stop,
+            motion_context="transition -> {}".format(name),
         )
 
     def _hold(self, name, pose, duration_s, ignore_first_stop=False):
@@ -647,6 +749,7 @@ class HardwareGestureController:
             duration_s,
             lambda _alpha: pose,
             ignore_first_stop=ignore_first_stop,
+            motion_context="hold {}".format(name),
         )
 
     def _neutralize(self, duration_s):
@@ -683,13 +786,13 @@ class HardwareGestureController:
         for cycle in range(1, HEIGHT_CYCLES + 1):
             print("height cycle {}/{}".format(cycle, HEIGHT_CYCLES), flush=True)
             current_pose = self._transition(
-                "low", current_pose, LOW, HEIGHT_TRANSITION_S
+                "low", current_pose, LOW, self.timing.transition_s
             )
-            self._hold("low", LOW, HEIGHT_HOLD_S)
+            self._hold("low", LOW, self.timing.hold_s)
             current_pose = self._transition(
-                "high", current_pose, HIGH, HEIGHT_TRANSITION_S
+                "high", current_pose, HIGH, self.timing.transition_s
             )
-            self._hold("high", HIGH, HEIGHT_HOLD_S)
+            self._hold("high", HIGH, self.timing.hold_s)
 
         current_pose = self._transition(
             "standard",
@@ -716,16 +819,16 @@ class HardwareGestureController:
                 "right roll",
                 current_pose,
                 ROLL_RIGHT,
-                ROLL_TRANSITION_S,
+                self.timing.transition_s,
             )
-            self._hold("right roll", ROLL_RIGHT, ROLL_HOLD_S)
+            self._hold("right roll", ROLL_RIGHT, self.timing.hold_s)
             current_pose = self._transition(
                 "left roll",
                 current_pose,
                 ROLL_LEFT,
-                ROLL_TRANSITION_S,
+                self.timing.transition_s,
             )
-            self._hold("left roll", ROLL_LEFT, ROLL_HOLD_S)
+            self._hold("left roll", ROLL_LEFT, self.timing.hold_s)
 
         current_pose = self._transition(
             "standard",
@@ -813,6 +916,7 @@ class HardwareGestureController:
             raise RuntimeError("--live requires an interactive TTY confirmation")
         print("\nLIVE HARDWARE PRECHECK PASSED", flush=True)
         print("  selected gesture: {}".format(self.gesture), flush=True)
+        print("  timing profile: {}".format(self.timing.name), flush=True)
         print("  NIC: {} = {}".format(self.interface, self.expected_ip), flush=True)
         print(
             "  active motion service: form={!r}, name={!r}".format(
@@ -883,7 +987,7 @@ class HardwareGestureController:
         mode_form, mode_name = self._check_mode()
         prone_pose, rpy = self._capture_stable_prone()
 
-        print_sequence_plan(self.gesture)
+        print_sequence_plan(self.gesture, self.timing)
         print(
             "read-only preflight: form={!r}, active mode={!r}, stable prone pose confirmed".format(
                 mode_form, mode_name
@@ -991,10 +1095,12 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def main(argv=None):
+def main(argv=None, timing=SLOW_TIMING):
+    if not isinstance(timing, GestureTimingProfile):
+        raise ValueError("invalid timing profile: {!r}".format(timing))
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.describe:
-        print_sequence_plan(args.gesture)
+        print_sequence_plan(args.gesture, timing)
         return 0
     if args.gesture is None:
         print(
@@ -1011,6 +1117,7 @@ def main(argv=None):
             args.interface,
             args.expected_ip,
             args.gesture,
+            timing=timing,
         )
         signal.signal(signal.SIGINT, controller.request_stop)
         signal.signal(signal.SIGTERM, controller.request_stop)

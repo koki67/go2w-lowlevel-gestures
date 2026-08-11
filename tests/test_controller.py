@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 import go2w_gesture_real as controller_module
+import go2w_gesture_real_legacy as legacy_module
 
 
 PRONE = [0.0, 1.36, -2.65] * 4
@@ -128,6 +129,43 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(neutral_command["kp"], [0.0] * 16)
         self.assertEqual(neutral_command["kd"], [0.0] * 16)
 
+    def test_tracking_watchdog_reports_all_exceeded_leg_joints(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "height"
+        )
+        commanded = list(controller_module.STANDARD)
+        measured = list(commanded)
+        measured[2] += 0.4501
+        measured[6] -= 0.52
+        measured[10] += 0.44
+        controller._latest_sample = mock.Mock(
+            return_value=controller_module.StateSample(
+                received_at=time.monotonic(),
+                pose=measured,
+                leg_velocity=[0.0] * 12,
+                wheel_velocity=[0.0] * 4,
+                rpy=[0.0, 0.0, 0.0],
+            )
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            controller._check_runtime(
+                commanded,
+                motion_context="transition -> high",
+                motion_elapsed_s=1.25,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("2/12 leg joints", message)
+        self.assertIn("during transition -> high at 1.250 s", message)
+        self.assertIn("max_abs_error=0.520000000 rad", message)
+        self.assertIn("limit=0.450000000 rad", message)
+        self.assertIn("motor[2]/q[2] FR_calf", message)
+        self.assertIn("motor[6]/q[6] RR_hip", message)
+        self.assertNotIn("motor[10]/q[10] RL_thigh", message)
+        self.assertIn("commanded-measured=-0.450100000 rad", message)
+        self.assertIn("commanded-measured=+0.520000000 rad", message)
+
     def test_dds_write_failure_is_not_ignored(self):
         controller = controller_module.HardwareGestureController(
             "eth0", "192.168.123.18", "height"
@@ -140,8 +178,16 @@ class ControllerTests(unittest.TestCase):
             controller._write_pose(controller_module.STANDARD)
 
     def run_accelerated_sequence(self, gesture):
+        accelerated_timing = controller_module.GestureTimingProfile(
+            name="accelerated-test",
+            transition_s=0.01,
+            hold_s=0.01,
+        )
         controller = controller_module.HardwareGestureController(
-            "eth0", "192.168.123.18", gesture
+            "eth0",
+            "192.168.123.18",
+            gesture,
+            timing=accelerated_timing,
         )
         publisher = FakePublisher()
         controller._publisher = publisher
@@ -167,12 +213,8 @@ class ControllerTests(unittest.TestCase):
         timing_overrides = {
             "CONTROL_PERIOD_S": 0.001,
             "STANDARD_TRANSITION_S": 0.02,
-            "HEIGHT_TRANSITION_S": 0.01,
             "PRONE_TRANSITION_S": 0.02,
             "STANDARD_HOLD_S": 0.01,
-            "HEIGHT_HOLD_S": 0.01,
-            "ROLL_TRANSITION_S": 0.01,
-            "ROLL_HOLD_S": 0.01,
             "PRONE_HOLD_S": 0.01,
             "NEUTRAL_COMMAND_S": 0.01,
             "HEIGHT_CYCLES": 1,
@@ -209,6 +251,66 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(pose_was_commanded(PRONE))
         self.assertTrue(controller._ended_prone)
         self.assertTrue(controller._neutralized)
+
+    def test_legacy_script_selects_legacy_timing_profile(self):
+        with mock.patch.object(
+            legacy_module, "controller_main", return_value=0
+        ) as controller_main:
+            self.assertEqual(legacy_module.main(["--describe"]), 0)
+
+        controller_main.assert_called_once_with(
+            ["--describe"], timing=controller_module.LEGACY_TIMING
+        )
+
+    def test_legacy_profile_applies_to_height_and_roll_cycles(self):
+        for gesture in ("height", "roll"):
+            controller = controller_module.HardwareGestureController(
+                "eth0",
+                "192.168.123.18",
+                gesture,
+                timing=controller_module.LEGACY_TIMING,
+            )
+            controller._captured_prone = list(PRONE)
+            controller._latest_sample = mock.Mock(
+                return_value=controller_module.StateSample(
+                    received_at=time.monotonic(),
+                    pose=list(PRONE),
+                    leg_velocity=[0.0] * 12,
+                    wheel_velocity=[0.0] * 4,
+                    rpy=[0.0, 0.0, 0.0],
+                )
+            )
+
+            transitions = []
+            holds = []
+
+            def transition(name, _source, target, duration, **_kwargs):
+                transitions.append((name, duration))
+                return list(target)
+
+            def hold(name, _pose, duration, **_kwargs):
+                holds.append((name, duration))
+
+            controller._transition = transition
+            controller._hold = hold
+            controller._neutralize = mock.Mock()
+            controller._run_selected_gesture()
+
+            cycle_names = (
+                ("low", "high")
+                if gesture == "height"
+                else ("right roll", "left roll")
+            )
+            cycle_transitions = [
+                duration
+                for name, duration in transitions
+                if name in cycle_names
+            ]
+            cycle_holds = [
+                duration for name, duration in holds if name in cycle_names
+            ]
+            self.assertEqual(cycle_transitions, [1.0] * 6)
+            self.assertEqual(cycle_holds, [0.5] * 6)
 
     def test_accelerated_roll_sequence(self):
         controller, pose_was_commanded = self.run_accelerated_sequence("roll")
