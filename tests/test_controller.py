@@ -14,6 +14,14 @@ class FakePublisher:
     def __init__(self):
         self.commands = []
         self.fail = False
+        self.initialized = False
+        self.closed = False
+
+    def Init(self):
+        self.initialized = True
+
+    def Close(self):
+        self.closed = True
 
     def Write(self, command):
         if self.fail:
@@ -176,6 +184,172 @@ class ControllerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "DDS write failed"):
             controller._write_pose(controller_module.STANDARD)
+
+    def test_release_mode_failure_stops_before_lowcmd(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "height"
+        )
+        controller._motion_switcher = mock.Mock()
+        controller._motion_switcher.ReleaseMode.return_value = (3101, None)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "ReleaseMode failed on attempt 1: code=3101"
+        ):
+            controller._release_mode("ai-w")
+
+        self.assertFalse(controller._mode_released)
+        self.assertTrue(controller._mode_release_attempted)
+        controller._motion_switcher.CheckMode.assert_not_called()
+
+    def test_restore_mode_selects_captured_service_and_confirms_it(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "height"
+        )
+        controller._mode_released = True
+        controller._motion_switcher = mock.Mock()
+        controller._motion_switcher.SelectMode.return_value = (0, None)
+        controller._check_mode = mock.Mock(
+            side_effect=[("", ""), ("1", "ai-w")]
+        )
+
+        with mock.patch.object(controller_module.time, "sleep"):
+            controller._restore_mode("ai-w")
+
+        controller._motion_switcher.SelectMode.assert_called_once_with("ai-w")
+        self.assertTrue(controller._mode_restore_attempted)
+        self.assertTrue(controller._mode_restored)
+        self.assertFalse(controller._mode_released)
+
+    def test_restore_mode_rpc_failure_remains_fail_closed(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "height"
+        )
+        controller._mode_released = True
+        controller._motion_switcher = mock.Mock()
+        controller._motion_switcher.SelectMode.return_value = (3102, None)
+        controller._check_mode = mock.Mock()
+
+        with self.assertRaisesRegex(
+            RuntimeError, r"SelectMode\('ai-w'\) failed: code=3102"
+        ):
+            controller._restore_mode("ai-w")
+
+        self.assertTrue(controller._mode_restore_attempted)
+        self.assertFalse(controller._mode_restored)
+        self.assertTrue(controller._mode_released)
+        controller._check_mode.assert_not_called()
+
+    def _configure_live_run(self, controller, mode):
+        fake_publisher = FakePublisher()
+        controller._initialize_dds = mock.Mock()
+        controller._wait_for_first_state = mock.Mock()
+        controller._check_mode = mock.Mock(return_value=mode)
+        controller._capture_stable_prone = mock.Mock(
+            return_value=(list(PRONE), [0.0, 0.0, 0.0])
+        )
+        controller._confirm_live = mock.Mock()
+        controller._wait_for_lowcmd_quiet = mock.Mock()
+
+        def complete_gesture():
+            controller._ended_prone = True
+            controller._neutralized = True
+
+        controller._run_selected_gesture = mock.Mock(side_effect=complete_gesture)
+        return fake_publisher
+
+    def test_live_run_accepts_already_released_mode_when_lowcmd_is_quiet(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "height"
+        )
+        fake_publisher = self._configure_live_run(controller, ("", ""))
+        controller._sport_client = mock.Mock()
+
+        with mock.patch.object(
+            controller_module, "interface_ipv4", return_value="192.168.123.18"
+        ), mock.patch.object(
+            controller_module, "ChannelPublisher", return_value=fake_publisher
+        ):
+            controller.run(live=True)
+
+        controller._sport_client.StopMove.assert_not_called()
+        controller._wait_for_lowcmd_quiet.assert_called_once_with(
+            handoff="starting this LowCmd publisher"
+        )
+        self.assertEqual(controller._capture_stable_prone.call_count, 2)
+        self.assertTrue(controller._mode_released)
+        self.assertIsNone(controller._restore_mode_name)
+        self.assertTrue(fake_publisher.initialized)
+        self.assertTrue(fake_publisher.closed)
+        self.assertIsNone(controller._publisher)
+
+    def test_live_run_restores_startup_mode_only_after_closing_lowcmd(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "height"
+        )
+        fake_publisher = self._configure_live_run(controller, ("1", "ai-w"))
+        controller._sport_client = mock.Mock()
+        controller._sport_client.StopMove.return_value = 0
+
+        def release_mode(name):
+            self.assertEqual(name, "ai-w")
+            controller._mode_released = True
+
+        controller._release_mode = mock.Mock(side_effect=release_mode)
+
+        def restore_mode(name):
+            self.assertTrue(fake_publisher.closed)
+            self.assertIsNone(controller._publisher)
+            self.assertEqual(name, "ai-w")
+
+        controller._restore_mode = mock.Mock(side_effect=restore_mode)
+
+        with mock.patch.object(
+            controller_module, "interface_ipv4", return_value="192.168.123.18"
+        ), mock.patch.object(
+            controller_module, "ChannelPublisher", return_value=fake_publisher
+        ), mock.patch.object(controller_module.time, "sleep"):
+            controller.run(live=True)
+
+        controller._sport_client.StopMove.assert_called_once_with()
+        controller._release_mode.assert_called_once_with("ai-w")
+        controller._restore_mode.assert_called_once_with("ai-w")
+        self.assertEqual(
+            controller._wait_for_lowcmd_quiet.call_args_list,
+            [
+                mock.call(handoff="starting this LowCmd publisher"),
+                mock.call(ignore_stop=True, handoff="Sport Mode restoration"),
+            ],
+        )
+
+    def test_watchdog_failure_closes_lowcmd_without_restoring_sport(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "height"
+        )
+        fake_publisher = self._configure_live_run(controller, ("1", "ai-w"))
+        controller._sport_client = mock.Mock()
+        controller._sport_client.StopMove.return_value = 0
+        controller._release_mode = mock.Mock(
+            side_effect=lambda _name: setattr(controller, "_mode_released", True)
+        )
+        controller._run_selected_gesture = mock.Mock(
+            side_effect=RuntimeError("joint tracking watchdog triggered")
+        )
+        controller._neutralize = mock.Mock(
+            side_effect=lambda _duration: setattr(controller, "_neutralized", True)
+        )
+        controller._restore_mode = mock.Mock()
+
+        with mock.patch.object(
+            controller_module, "interface_ipv4", return_value="192.168.123.18"
+        ), mock.patch.object(
+            controller_module, "ChannelPublisher", return_value=fake_publisher
+        ), mock.patch.object(controller_module.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "tracking watchdog"):
+                controller.run(live=True)
+
+        self.assertTrue(fake_publisher.closed)
+        controller._restore_mode.assert_not_called()
+        self.assertTrue(controller._mode_released)
 
     def run_accelerated_sequence(self, gesture):
         accelerated_timing = controller_module.GestureTimingProfile(

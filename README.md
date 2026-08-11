@@ -19,7 +19,8 @@ the repeated gesture transition/hold timing differs.
 | `go2w_gesture_real_fast.py` | `fast` | 1.0 s | 0.5 s |
 
 Every live gesture shares the same control-ownership checks, watchdogs,
-captured-prone shutdown, and explicit confirmation boundary.
+captured-prone shutdown, explicit confirmation boundary, and conditional Sport
+Mode restoration.
 
 ## Clone, build, and inspect
 
@@ -64,7 +65,8 @@ hold, and return to captured prone is 3.0 s with a 2.0 s hold.
   fast `1.0/0.5 s` transition/hold.
 - High to standard: 2.0 s; hold standard: 2.0 s.
 - Standard to captured prone: 3.0 s; hold prone: 2.0 s.
-- Zero-gain neutral command: 1.0 s, then stop LowCmd.
+- Zero-gain neutral command: 1.0 s, close LowCmd, then restore the Sport service
+  captured at startup when one was active.
 
 ### Roll
 
@@ -78,7 +80,8 @@ The roll gesture deliberately uses 70% of that value: `0.66304 rad` (about
   or fast `1.0/0.5 s` transition/hold.
 - Left to standard: 2.0 s; hold standard: 2.0 s.
 - Standard to captured prone: 3.0 s; hold prone: 2.0 s.
-- Zero-gain neutral command: 1.0 s, then stop LowCmd.
+- Zero-gain neutral command: 1.0 s, close LowCmd, then restore the Sport service
+  captured at startup when one was active.
 
 The MuJoCo run reached approximately `+27.7/-27.6 degrees` of measured body
 roll without falling and returned close to level. This is simulation evidence,
@@ -111,7 +114,9 @@ aliases for the slow profile.
 
 Preflight initializes DDS, reads `rt/lowstate`, and calls read-only
 `CheckMode()`. It verifies the expected NIC/IP, stable prone pose, joint and
-wheel velocities, IMU tilt, active Sport service, and selected gesture targets.
+wheel velocities, IMU tilt, current Sport-service state, and selected gesture
+targets. An empty service name is reported as an already-released state rather
+than rejected.
 It does **not** call `StopMove()`, `ReleaseMode()`, `SelectMode()`, or publish
 `LowCmd`.
 
@@ -151,29 +156,44 @@ The live ownership sequence is common to both gestures:
 
 1. Confirm a stable, belly-down measured pose.
 2. Require the gesture-specific interactive phrase.
-3. Send Sport `StopMove()`.
-4. Re-measure the prone shutdown target.
-5. Repeatedly call `CheckMode()` and `ReleaseMode()` until no Sport service is
-   active.
+3. If `CheckMode()` reported an active Sport service, save its exact name, send
+   Sport `StopMove()`, and repeatedly call `ReleaseMode()` plus `CheckMode()`
+   until it is inactive. Any nonzero release result aborts before LowCmd starts.
+4. If Sport was already released, skip `StopMove()`/`ReleaseMode()` and retain
+   the released state.
+5. Re-measure the prone shutdown target.
 6. Require `rt/lowcmd` to become quiet before creating the sole user publisher.
 7. Run the selected gesture at a nominal 500 Hz.
-8. Return to the hardware-measured initial prone pose.
-9. Hold prone, publish a zero-gain neutral command briefly, and stop LowCmd.
+8. Return to the hardware-measured initial prone pose and hold it.
+9. Publish a zero-gain neutral command briefly, stop publishing, and explicitly
+   close the LowCmd DDS writer.
+10. After another quiet-topic interval, call `SelectMode()` with the saved
+    startup service name and require `CheckMode()` to confirm it.
 
 There is intentionally no ambiguous `make live` target. The gesture name must
 be part of the command and is shown again before confirmation.
 
 ## Sport Mode restoration boundary
 
-The SDK exposes `MotionSwitcherClient.SelectMode()`, but this repository does
-not automatically reactivate Sport Mode. An overlap-free handoff from a live
-user LowCmd publisher to the specific Go2W firmware's Sport controller has not
-been qualified. Automatic restoration could create either a command gap or two
-simultaneous owners.
+Automatic restoration is attempted only after the controller confirms that it
+has returned to the captured prone pose. It closes its LowCmd DDS writer first,
+waits for `rt/lowcmd` to stay quiet, calls `SelectMode()` with the exact service
+name captured at startup (normally `ai-w` on Go2W), and polls `CheckMode()` until
+that same name is active. Failure to close the writer, a nonzero `SelectMode()`
+result, an unexpected active service, or a confirmation timeout makes the
+script exit nonzero; it does not claim that Sport stabilization is active.
 
-Consequently, the successful final state is belly-down, LowCmd stopped, and
-Sport Mode still released. Reactivate Sport Mode only with a separate,
-qualified procedure while the robot is safely supported.
+If the script starts with no active service, it may proceed only after the
+stable-prone and quiet-`rt/lowcmd` checks. Because there is no startup service
+name to restore, successful completion leaves Sport released. This permits a
+new invocation to recover after an earlier low-level run without guessing a
+firmware-specific mode name.
+
+A watchdog, hard stop, failed controlled return, process kill, host failure, or
+network loss does not trigger automatic Sport restoration. In those cases the
+posture is not confirmed safe for the ownership handoff. Keep the robot
+supported and do not assume either software fallback succeeded. The restoration
+sequence is unit-tested but remains unqualified on physical Go2W hardware.
 
 ## Runtime watchdogs
 
@@ -184,6 +204,7 @@ The live controller fails closed on:
 - any of the 12 position-controlled leg-joint tracking errors above `0.45 rad`;
 - DDS write failure;
 - failure to release Sport Mode;
+- failure to close LowCmd or restore and confirm the captured Sport service;
 - LowCmd traffic that does not become quiet after release;
 - NIC or IP mismatch;
 - unstable or implausible initial prone pose;
@@ -239,7 +260,8 @@ hierarchy; the checkout itself is not patched.
   live attempts stopped on the provisional `0.45 rad` joint-tracking watchdog;
   the full sequence remains unqualified.
 - Go2W roll hardware motion: not yet performed.
-- Automatic Sport Mode restoration: intentionally not implemented.
+- Automatic Sport Mode restoration after a confirmed prone return: implemented
+  and unit-tested, but not yet physically qualified on Go2W hardware.
 
 Do not interpret a successful build, dry-run, or simulation as physical
 qualification.

@@ -4,11 +4,11 @@
 The default invocation is a read-only preflight. Physical motion requires the
 explicit ``--live`` flag and a confirmation phrase entered on a TTY.
 
-This program intentionally does not reactivate Sport Mode after LowCmd. The
-safe overlap-free handoff from a user LowCmd publisher back to the Go2W Sport
-controller has not been qualified here. Instead, the live sequence records the
-robot's stable initial prone joint pose, returns to that measured pose, sends a
-neutral zero-gain command briefly, and then stops publishing.
+After a confirmed return to the captured prone pose, the live sequence sends a
+neutral zero-gain command, closes its LowCmd writer, waits for the topic to
+become quiet, and requests the Sport service that was active at startup. If the
+script starts with Sport already released, there is no captured service name to
+restore; the script may still run after the same quiet-topic ownership check.
 
 Supported deployment targets are Python 3.8+ on the Jetson host or a host-
 networked container with ``unitree_sdk2py`` installed. ROS 2 is not used by the
@@ -28,7 +28,7 @@ import struct
 import sys
 import threading
 import time
-from typing import List
+from typing import List, Optional
 
 
 DDS_DOMAIN = 0
@@ -61,6 +61,7 @@ RUN_MAX_TRACKING_ERROR_RAD = 0.45
 LOWCMD_QUIET_S = 0.5
 LOWCMD_QUIET_TIMEOUT_S = 3.0
 MODE_RELEASE_TIMEOUT_S = 10.0
+MODE_SELECT_TIMEOUT_S = 10.0
 
 POS_STOP_F = 2.146e9
 VEL_STOP_F = 16000.0
@@ -254,8 +255,12 @@ def print_common_shutdown_plan():
     print("  hold standard: {:.1f} s".format(STANDARD_HOLD_S))
     print("  standard -> captured prone: {:.1f} s".format(PRONE_TRANSITION_S))
     print("  hold prone: {:.1f} s".format(PRONE_HOLD_S))
-    print("  neutral zero-gain command: {:.1f} s, then stop LowCmd".format(NEUTRAL_COMMAND_S))
-    print("  Sport Mode is not reactivated automatically")
+    print(
+        "  neutral zero-gain command: {:.1f} s, then close LowCmd".format(
+            NEUTRAL_COMMAND_S
+        )
+    )
+    print("  restore the captured Sport service when one was active at startup")
 
 
 def print_height_plan(timing=SLOW_TIMING):
@@ -358,6 +363,10 @@ class HardwareGestureController:
         self._crc = CRC()
         self._last_commanded_pose = None  # type: Optional[List[float]]
         self._mode_released = False
+        self._mode_release_attempted = False
+        self._restore_mode_name = None  # type: Optional[str]
+        self._mode_restore_attempted = False
+        self._mode_restored = False
         self._neutralized = False
         self._ended_prone = False
         self._captured_prone = None  # type: Optional[List[float]]
@@ -574,6 +583,7 @@ class HardwareGestureController:
             if self._stop_requested.is_set():
                 raise InterruptedSequence()
             attempt += 1
+            self._mode_release_attempted = True
             code, _ = self._motion_switcher.ReleaseMode()
             if code != 0:
                 raise RuntimeError(
@@ -597,10 +607,10 @@ class HardwareGestureController:
             "Sport service {!r} remained active after ReleaseMode".format(expected_name)
         )
 
-    def _wait_for_lowcmd_quiet(self):
+    def _wait_for_lowcmd_quiet(self, ignore_stop=False, handoff="LowCmd ownership"):
         deadline = time.monotonic() + LOWCMD_QUIET_TIMEOUT_S
         while time.monotonic() < deadline:
-            if self._stop_requested.is_set():
+            if self._stop_requested.is_set() and not ignore_stop:
                 raise InterruptedSequence()
             with self._lock:
                 last_lowcmd_time = self._last_lowcmd_time
@@ -611,7 +621,67 @@ class HardwareGestureController:
                 return
             time.sleep(0.02)
         raise RuntimeError(
-            "rt/lowcmd did not become quiet after ReleaseMode; another command writer may be active"
+            "rt/lowcmd did not become quiet before {}; another command writer may be active".format(
+                handoff
+            )
+        )
+
+    def _close_lowcmd_publisher(self):
+        self._publishing = False
+        publisher = self._publisher
+        self._publisher = None
+        if publisher is None:
+            return
+        publisher.Close()
+        # Enforce a full quiet interval after our final sample. The subscriber
+        # extends this timestamp if any other LowCmd writer is still active.
+        with self._lock:
+            self._last_lowcmd_time = time.monotonic()
+
+    def _restore_mode(self, expected_name):
+        if not expected_name:
+            raise RuntimeError(
+                "cannot restore Sport Mode without a captured service name"
+            )
+
+        self._mode_restore_attempted = True
+        code, _ = self._motion_switcher.SelectMode(expected_name)
+        if code != 0:
+            raise RuntimeError(
+                "MotionSwitcher SelectMode({!r}) failed: code={}".format(
+                    expected_name, code
+                )
+            )
+
+        deadline = time.monotonic() + MODE_SELECT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if self._hard_stop_requested.is_set():
+                raise RuntimeError(
+                    "hard stop requested while waiting for Sport Mode restoration"
+                )
+            _form, active_name = self._check_mode()
+            if active_name == expected_name:
+                self._mode_released = False
+                self._mode_restored = True
+                print(
+                    "Sport service {!r} restored and confirmed by CheckMode()".format(
+                        expected_name
+                    ),
+                    flush=True,
+                )
+                return
+            if active_name:
+                raise RuntimeError(
+                    "SelectMode({!r}) activated unexpected service {!r}".format(
+                        expected_name, active_name
+                    )
+                )
+            time.sleep(0.25)
+
+        raise RuntimeError(
+            "Sport service {!r} was not confirmed after SelectMode".format(
+                expected_name
+            )
         )
 
     def _check_runtime(
@@ -924,6 +994,19 @@ class HardwareGestureController:
             ),
             flush=True,
         )
+        if mode_name:
+            print(
+                "  ownership handoff: release {!r}, run LowCmd, then restore {!r}".format(
+                    mode_name, mode_name
+                ),
+                flush=True,
+            )
+        else:
+            print(
+                "  ownership handoff: Sport is already released; proceed only if "
+                "rt/lowcmd is quiet, and leave Sport released at the end",
+                flush=True,
+            )
         print(
             "  captured prone q[0:12]: [{}]".format(
                 ", ".join("{:.4f}".format(value) for value in prone_pose)
@@ -943,10 +1026,12 @@ class HardwareGestureController:
         )
         confirmation = LIVE_CONFIRMATIONS[self.gesture]
         entered = input(
-            "Type {!r} to release Sport Mode and move: ".format(confirmation)
+            "Type {!r} to take LowCmd ownership and move: ".format(confirmation)
         )
         if entered.strip() != confirmation:
-            raise RuntimeError("live confirmation did not match; no mode was released")
+            raise RuntimeError(
+                "live confirmation did not match; LowCmd ownership was not changed"
+            )
         if self._stop_requested.is_set():
             raise InterruptedSequence()
 
@@ -1001,28 +1086,37 @@ class HardwareGestureController:
             )
             return
 
-        if not mode_name:
-            raise RuntimeError(
-                "no active Sport service was reported; refusing to assume LowCmd ownership"
-            )
-
         self._confirm_live(mode_form, mode_name, prone_pose, rpy)
 
-        stop_code = self._sport_client.StopMove()
-        if stop_code != 0:
-            raise RuntimeError("SportClient StopMove failed: code={}".format(stop_code))
-        time.sleep(0.5)
+        if mode_name:
+            self._restore_mode_name = mode_name
+            stop_code = self._sport_client.StopMove()
+            if stop_code != 0:
+                raise RuntimeError(
+                    "SportClient StopMove failed: code={}".format(stop_code)
+                )
+            time.sleep(0.5)
+        else:
+            self._mode_released = True
+            print(
+                "no active Sport service was reported; treating the robot as already "
+                "released and requiring rt/lowcmd to be quiet before continuing",
+                flush=True,
+            )
 
-        # Re-measure after StopMove so the shutdown target is the actual stable
-        # hardware pose immediately before releasing the motion service.
+        # Re-measure after confirmation (and after StopMove when Sport was
+        # active) so shutdown uses the actual stable pose immediately before
+        # this process takes LowCmd ownership.
         self._captured_prone, _rpy = self._capture_stable_prone()
-        self._release_mode(mode_name)
-        self._wait_for_lowcmd_quiet()
+        if mode_name:
+            self._release_mode(mode_name)
+        self._wait_for_lowcmd_quiet(handoff="starting this LowCmd publisher")
 
         self._publisher = ChannelPublisher("rt/lowcmd", LowCmd_)
         self._publisher.Init()
         self._publishing = True
 
+        publisher_close_error = None
         try:
             self._run_selected_gesture()
         except InterruptedSequence:
@@ -1040,20 +1134,47 @@ class HardwareGestureController:
                         file=sys.stderr,
                         flush=True,
                     )
-            self._publishing = False
+            try:
+                self._close_lowcmd_publisher()
+            except Exception as error:
+                publisher_close_error = error
+                print(
+                    "failed to close the LowCmd publisher: {}".format(error),
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        if publisher_close_error is not None:
+            raise RuntimeError(
+                "LowCmd publisher close failed; refusing Sport Mode restoration: {}".format(
+                    publisher_close_error
+                )
+            )
 
         if self._ended_prone:
-            print(
-                "LowCmd publication stopped after the captured prone pose was held. "
-                "Sport Mode remains released; reactivate it only through a separately "
-                "qualified procedure while the robot is safely supported.",
-                flush=True,
-            )
+            if self._restore_mode_name:
+                self._wait_for_lowcmd_quiet(
+                    ignore_stop=True,
+                    handoff="Sport Mode restoration",
+                )
+                self._restore_mode(self._restore_mode_name)
+                print(
+                    "LowCmd publication stopped after the captured prone pose was held; "
+                    "the startup Sport service is active again.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "LowCmd publication stopped after the captured prone pose was held. "
+                    "Sport was already released at startup, so no service name was "
+                    "available to restore; Sport remains released.",
+                    flush=True,
+                )
         else:
             print(
                 "WARNING: LowCmd publication stopped without confirming the captured "
                 "prone pose. Keep the robot supported and use the hardware E-stop. "
-                "Sport Mode remains released.",
+                "Sport Mode was not restored automatically.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -1127,10 +1248,14 @@ def main(argv=None, timing=SLOW_TIMING):
         return 130
     except (RuntimeError, ValueError) as error:
         print("error: {}".format(error), file=sys.stderr, flush=True)
-        if controller is not None and controller._mode_released:
+        if controller is not None and (
+            controller._mode_released
+            or controller._mode_release_attempted
+            or controller._mode_restore_attempted
+        ):
             print(
-                "WARNING: Sport Mode was released and was not reactivated. Keep the "
-                "robot supported; do not assume Sport stabilization is active.",
+                "WARNING: Sport Mode is released or restoration was not confirmed. "
+                "Keep the robot supported; do not assume Sport stabilization is active.",
                 file=sys.stderr,
                 flush=True,
             )
