@@ -47,7 +47,7 @@ but sourcing a ROS environment is not required.
 ### Height
 
 - Captured prone to standard: 2.0 s; hold standard: 2.0 s.
-- Three low/high cycles, each transition 1.0 s and hold 0.5 s.
+- Three low/high cycles, each transition 2.0 s and hold 2.0 s.
 - High to standard: 2.0 s; hold standard: 2.0 s.
 - Standard to captured prone: 3.0 s; hold prone: 2.0 s.
 - Zero-gain neutral command: 1.0 s, then stop LowCmd.
@@ -60,7 +60,7 @@ The roll gesture deliberately uses 70% of that value: `0.66304 rad` (about
 38.0 degrees of joint offset).
 
 - Captured prone to standard: 2.0 s; hold standard: 2.0 s.
-- Three right/left cycles, each transition 0.75 s and hold 0.5 s.
+- Three right/left cycles, each transition 2.0 s and hold 2.0 s.
 - Left to standard: 2.0 s; hold standard: 2.0 s.
 - Standard to captured prone: 3.0 s; hold prone: 2.0 s.
 - Zero-gain neutral command: 1.0 s, then stop LowCmd.
@@ -193,7 +193,9 @@ hierarchy; the checkout itself is not patched.
 - Roll MuJoCo motion: validated at 70% URDF-derived hip offset and 0.75 s
   transitions.
 - Jetson `aarch64` image build and 500 Hz timing: not yet measured.
-- Go2W height hardware motion: not yet performed.
+- Go2W height hardware motion: one live attempt reached the first low-to-high
+  transition, then stopped on the `0.45 rad` joint-tracking watchdog; the full
+  sequence remains unqualified.
 - Go2W roll hardware motion: not yet performed.
 - Automatic Sport Mode restoration: intentionally not implemented.
 

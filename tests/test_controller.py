@@ -220,6 +220,51 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(controller._ended_prone)
         self.assertTrue(controller._neutralized)
 
+    def test_height_sequence_order_and_timing(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "height"
+        )
+        controller._captured_prone = list(PRONE)
+        controller._latest_sample = mock.Mock(
+            return_value=controller_module.StateSample(
+                received_at=time.monotonic(),
+                pose=list(PRONE),
+                leg_velocity=[0.0] * 12,
+                wheel_velocity=[0.0] * 4,
+                rpy=[0.0, 0.0, 0.0],
+            )
+        )
+
+        transitions = []
+        holds = []
+
+        def transition(name, _source, target, duration, **_kwargs):
+            transitions.append((name, duration))
+            return list(target)
+
+        def hold(name, _pose, duration, **_kwargs):
+            holds.append((name, duration))
+
+        controller._transition = transition
+        controller._hold = hold
+        controller._neutralize = mock.Mock()
+        controller._run_height_sequence()
+
+        expected_transitions = [("standard", 2.0)]
+        for _cycle in range(3):
+            expected_transitions.extend([("low", 2.0), ("high", 2.0)])
+        expected_transitions.extend(
+            [("standard", 2.0), ("captured prone", 3.0)]
+        )
+        self.assertEqual(transitions, expected_transitions)
+
+        expected_holds = [("standard", 2.0)]
+        for _cycle in range(3):
+            expected_holds.extend([("low", 2.0), ("high", 2.0)])
+        expected_holds.extend([("standard", 2.0), ("captured prone", 2.0)])
+        self.assertEqual(holds, expected_holds)
+        controller._neutralize.assert_called_once_with(1.0)
+
     def test_roll_targets_are_70_percent_and_inside_urdf_limits(self):
         self.assertAlmostEqual(controller_module.ROLL_AMPLITUDE_RAD, 0.66304)
         for pose in (controller_module.ROLL_RIGHT, controller_module.ROLL_LEFT):
@@ -264,7 +309,7 @@ class ControllerTests(unittest.TestCase):
         expected_transitions = [("standard", 2.0)]
         for _cycle in range(3):
             expected_transitions.extend(
-                [("right roll", 0.75), ("left roll", 0.75)]
+                [("right roll", 2.0), ("left roll", 2.0)]
             )
         expected_transitions.extend(
             [("standard", 2.0), ("captured prone", 3.0)]
@@ -274,7 +319,7 @@ class ControllerTests(unittest.TestCase):
         expected_holds = [("standard", 2.0)]
         for _cycle in range(3):
             expected_holds.extend(
-                [("right roll", 0.5), ("left roll", 0.5)]
+                [("right roll", 2.0), ("left roll", 2.0)]
             )
         expected_holds.extend([("standard", 2.0), ("captured prone", 2.0)])
         self.assertEqual(holds, expected_holds)
