@@ -4,7 +4,7 @@ import unittest
 from unittest import mock
 
 import go2w_gesture_real as controller_module
-import go2w_gesture_real_legacy as legacy_module
+import go2w_gesture_real_fast as fast_module
 
 
 PRONE = [0.0, 1.36, -2.65] * 4
@@ -252,23 +252,23 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(controller._ended_prone)
         self.assertTrue(controller._neutralized)
 
-    def test_legacy_script_selects_legacy_timing_profile(self):
+    def test_fast_script_selects_fast_timing_profile(self):
         with mock.patch.object(
-            legacy_module, "controller_main", return_value=0
+            fast_module, "controller_main", return_value=0
         ) as controller_main:
-            self.assertEqual(legacy_module.main(["--describe"]), 0)
+            self.assertEqual(fast_module.main(["--describe"]), 0)
 
         controller_main.assert_called_once_with(
-            ["--describe"], timing=controller_module.LEGACY_TIMING
+            ["--describe"], timing=controller_module.FAST_TIMING
         )
 
-    def test_legacy_profile_applies_to_height_and_roll_cycles(self):
+    def test_fast_profile_applies_to_height_and_roll_cycles(self):
         for gesture in ("height", "roll"):
             controller = controller_module.HardwareGestureController(
                 "eth0",
                 "192.168.123.18",
                 gesture,
-                timing=controller_module.LEGACY_TIMING,
+                timing=controller_module.FAST_TIMING,
             )
             controller._captured_prone = list(PRONE)
             controller._latest_sample = mock.Mock(

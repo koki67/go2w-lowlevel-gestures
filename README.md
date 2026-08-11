@@ -16,7 +16,7 @@ the repeated gesture transition/hold timing differs.
 | Script | Timing profile | Gesture transition | Gesture hold |
 | --- | --- | --- | --- |
 | `go2w_gesture_real.py` | `slow` | 2.0 s | 2.0 s |
-| `go2w_gesture_real_legacy.py` | `legacy` | 1.0 s | 0.5 s |
+| `go2w_gesture_real_fast.py` | `fast` | 1.0 s | 0.5 s |
 
 Every live gesture shares the same control-ownership checks, watchdogs,
 captured-prone shutdown, and explicit confirmation boundary.
@@ -61,7 +61,7 @@ hold, and return to captured prone is 3.0 s with a 2.0 s hold.
 
 - Captured prone to standard: 2.0 s; hold standard: 2.0 s.
 - Three low/high cycles using the selected profile timing: slow `2.0/2.0 s` or
-  legacy `1.0/0.5 s` transition/hold.
+  fast `1.0/0.5 s` transition/hold.
 - High to standard: 2.0 s; hold standard: 2.0 s.
 - Standard to captured prone: 3.0 s; hold prone: 2.0 s.
 - Zero-gain neutral command: 1.0 s, then stop LowCmd.
@@ -75,7 +75,7 @@ The roll gesture deliberately uses 70% of that value: `0.66304 rad` (about
 
 - Captured prone to standard: 2.0 s; hold standard: 2.0 s.
 - Three right/left cycles using the selected profile timing: slow `2.0/2.0 s`
-  or legacy `1.0/0.5 s` transition/hold.
+  or fast `1.0/0.5 s` transition/hold.
 - Left to standard: 2.0 s; hold standard: 2.0 s.
 - Standard to captured prone: 3.0 s; hold prone: 2.0 s.
 - Zero-gain neutral command: 1.0 s, then stop LowCmd.
@@ -99,11 +99,11 @@ make preflight-slow-height
 make preflight-slow-roll
 ```
 
-Legacy profile:
+Fast profile:
 
 ```bash
-make preflight-legacy-height
-make preflight-legacy-roll
+make preflight-fast-height
+make preflight-fast-roll
 ```
 
 The existing `make preflight-height` and `make preflight-roll` names remain
@@ -127,11 +127,11 @@ make live-slow-height
 make live-slow-roll
 ```
 
-Legacy height and roll gestures:
+Fast height and roll gestures:
 
 ```bash
-make live-legacy-height
-make live-legacy-roll
+make live-fast-height
+make live-fast-roll
 ```
 
 The required typed confirmation depends on the gesture, not the timing
@@ -235,7 +235,7 @@ hierarchy; the checkout itself is not patched.
   transitions.
 - Jetson `aarch64` image build and live startup: exercised; actual 500 Hz loop
   rate and jitter remain unmeasured.
-- Go2W height hardware motion: both legacy `1.0/0.5 s` and slow `2.0/2.0 s`
+- Go2W height hardware motion: both fast `1.0/0.5 s` and slow `2.0/2.0 s`
   live attempts stopped on the provisional `0.45 rad` joint-tracking watchdog;
   the full sequence remains unqualified.
 - Go2W roll hardware motion: not yet performed.

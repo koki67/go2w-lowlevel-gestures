@@ -2,31 +2,31 @@ COMPOSE := docker compose
 SERVICE := controller
 PYTHON := /opt/venv/bin/python
 SLOW_SCRIPT := /app/go2w_gesture_real.py
-LEGACY_SCRIPT := /app/go2w_gesture_real_legacy.py
+FAST_SCRIPT := /app/go2w_gesture_real_fast.py
 
 .PHONY: help build test clean describe \
 	describe-slow describe-slow-height describe-slow-roll \
-	describe-legacy describe-legacy-height describe-legacy-roll \
+	describe-fast describe-fast-height describe-fast-roll \
 	describe-height describe-roll \
 	preflight-slow-height preflight-slow-roll \
-	preflight-legacy-height preflight-legacy-roll \
+	preflight-fast-height preflight-fast-roll \
 	preflight-height preflight-roll \
 	live-slow-height live-slow-roll \
-	live-legacy-height live-legacy-roll \
+	live-fast-height live-fast-roll \
 	live-height live-roll
 
 help:
 	@echo "Non-hardware: make build | test | describe"
 	@echo "Slow 2.0/2.0 read-only: make preflight-slow-height | preflight-slow-roll"
 	@echo "Slow 2.0/2.0 physical:  make live-slow-height | live-slow-roll"
-	@echo "Legacy 1.0/0.5 read-only: make preflight-legacy-height | preflight-legacy-roll"
-	@echo "Legacy 1.0/0.5 physical:  make live-legacy-height | live-legacy-roll"
+	@echo "Fast 1.0/0.5 read-only: make preflight-fast-height | preflight-fast-roll"
+	@echo "Fast 1.0/0.5 physical:  make live-fast-height | live-fast-roll"
 	@echo "Compatibility: preflight-height/roll and live-height/roll use slow"
 
 build:
 	$(COMPOSE) build --pull
 
-describe: describe-slow describe-legacy
+describe: describe-slow describe-fast
 
 describe-slow:
 	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
@@ -40,17 +40,17 @@ describe-slow-roll:
 	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
 		$(SERVICE) $(SLOW_SCRIPT) --gesture roll --describe
 
-describe-legacy:
+describe-fast:
 	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
-		$(SERVICE) $(LEGACY_SCRIPT) --describe
+		$(SERVICE) $(FAST_SCRIPT) --describe
 
-describe-legacy-height:
+describe-fast-height:
 	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
-		$(SERVICE) $(LEGACY_SCRIPT) --gesture height --describe
+		$(SERVICE) $(FAST_SCRIPT) --gesture height --describe
 
-describe-legacy-roll:
+describe-fast-roll:
 	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
-		$(SERVICE) $(LEGACY_SCRIPT) --gesture roll --describe
+		$(SERVICE) $(FAST_SCRIPT) --gesture roll --describe
 
 describe-height: describe-slow-height
 
@@ -69,13 +69,13 @@ preflight-slow-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
 		$(SERVICE) $(SLOW_SCRIPT) --gesture roll
 
-preflight-legacy-height:
+preflight-fast-height:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
-		$(SERVICE) $(LEGACY_SCRIPT) --gesture height
+		$(SERVICE) $(FAST_SCRIPT) --gesture height
 
-preflight-legacy-roll:
+preflight-fast-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
-		$(SERVICE) $(LEGACY_SCRIPT) --gesture roll
+		$(SERVICE) $(FAST_SCRIPT) --gesture roll
 
 preflight-height: preflight-slow-height
 
@@ -89,13 +89,13 @@ live-slow-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
 		$(SERVICE) $(SLOW_SCRIPT) --gesture roll --live
 
-live-legacy-height:
+live-fast-height:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
-		$(SERVICE) $(LEGACY_SCRIPT) --gesture height --live
+		$(SERVICE) $(FAST_SCRIPT) --gesture height --live
 
-live-legacy-roll:
+live-fast-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
-		$(SERVICE) $(LEGACY_SCRIPT) --gesture roll --live
+		$(SERVICE) $(FAST_SCRIPT) --gesture roll --live
 
 live-height: live-slow-height
 

@@ -83,8 +83,8 @@ SLOW_TIMING = GestureTimingProfile(
     transition_s=2.0,
     hold_s=2.0,
 )
-LEGACY_TIMING = GestureTimingProfile(
-    name="legacy",
+FAST_TIMING = GestureTimingProfile(
+    name="fast",
     transition_s=1.0,
     hold_s=0.5,
 )
