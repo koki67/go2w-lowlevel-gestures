@@ -14,6 +14,8 @@ services:
     stdin_open: true
     tty: true
     read_only: true
+    volumes:
+      - ./runs:/app/runs
     tmpfs:
       - /tmp:size=64m,mode=1777
     security_opt:

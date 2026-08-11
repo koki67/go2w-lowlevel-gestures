@@ -1,3 +1,8 @@
+import csv
+from contextlib import redirect_stderr
+import io
+import json
+import tempfile
 import threading
 import time
 import unittest
@@ -138,14 +143,95 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(neutral_command["kd"], [0.0] * 16)
 
     def test_tracking_watchdog_reports_all_exceeded_leg_joints(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller = controller_module.HardwareGestureController(
+                "eth0", "192.168.123.18", "height"
+            )
+            controller._tracking_recorder = controller_module.TrackingRecorder(
+                temporary_directory,
+                "height",
+                controller_module.SLOW_TIMING,
+            )
+            controller._tracking_recorder.start()
+            commanded = list(controller_module.STANDARD)
+            measured = list(commanded)
+            measured[2] += 0.5501
+            measured[6] -= 0.62
+            measured[10] += 0.54
+            controller._latest_sample = mock.Mock(
+                return_value=controller_module.StateSample(
+                    received_at=time.monotonic(),
+                    pose=measured,
+                    leg_velocity=[0.0] * 12,
+                    wheel_velocity=[0.0] * 4,
+                    rpy=[0.01, -0.02, 0.03],
+                )
+            )
+
+            with self.assertRaises(RuntimeError) as raised:
+                controller._check_runtime(
+                    commanded,
+                    motion_context="transition -> high",
+                    motion_elapsed_s=1.25,
+                )
+
+            message = str(raised.exception)
+            self.assertIn("2/12 leg joints", message)
+            self.assertIn("during transition -> high at 1.250 s", message)
+            self.assertIn("max_abs_error=0.620000000 rad", message)
+            self.assertIn("limit=0.550000000 rad", message)
+            self.assertIn("motor[2]/q[2] FR_calf", message)
+            self.assertIn("motor[6]/q[6] RR_hip", message)
+            self.assertNotIn("motor[10]/q[10] RL_thigh", message)
+            self.assertIn("commanded-measured=-0.550100000 rad", message)
+            self.assertIn("commanded-measured=+0.620000000 rad", message)
+
+            # The row that triggers the stop is buffered before the exception.
+            self.assertEqual(controller._tracking_recorder.sample_count, 1)
+            csv_path, summary_path = controller.finalize_tracking_log(
+                "error", error_text=message
+            )
+            with csv_path.open(newline="", encoding="utf-8") as input_file:
+                rows = list(csv.DictReader(input_file))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["phase"], "transition -> high")
+            self.assertEqual(float(rows[0]["phase_elapsed_s"]), 1.25)
+            self.assertGreaterEqual(float(rows[0]["lowstate_age_s"]), 0.0)
+            self.assertAlmostEqual(
+                float(rows[0]["measured_FR_calf_rad"]), measured[2]
+            )
+            self.assertAlmostEqual(
+                float(rows[0]["target_FR_calf_rad"]), commanded[2]
+            )
+            self.assertAlmostEqual(
+                float(rows[0]["error_target_minus_measured_FR_calf_rad"]),
+                -0.5501,
+            )
+            for joint_name in controller_module.LEG_JOINT_NAMES:
+                self.assertIn("measured_{}_rad".format(joint_name), rows[0])
+                self.assertIn("target_{}_rad".format(joint_name), rows[0])
+                self.assertIn(
+                    "error_target_minus_measured_{}_rad".format(joint_name),
+                    rows[0],
+                )
+
+            with summary_path.open(encoding="utf-8") as input_file:
+                summary = json.load(input_file)
+            self.assertEqual(summary["sample_count"], 1)
+            self.assertEqual(summary["stop_crossing_sample_count"], 1)
+            self.assertGreaterEqual(summary["max_lowstate_age_s"], 0.0)
+            self.assertEqual(summary["global_peak"]["name"], "RR_hip")
+            self.assertAlmostEqual(
+                summary["global_peak"]["max_abs_error_rad"], 0.62
+            )
+
+    def test_old_stop_threshold_is_now_a_throttled_warning(self):
         controller = controller_module.HardwareGestureController(
             "eth0", "192.168.123.18", "height"
         )
         commanded = list(controller_module.STANDARD)
         measured = list(commanded)
-        measured[2] += 0.4501
-        measured[6] -= 0.52
-        measured[10] += 0.44
+        measured[8] += 0.46
         controller._latest_sample = mock.Mock(
             return_value=controller_module.StateSample(
                 received_at=time.monotonic(),
@@ -156,23 +242,75 @@ class ControllerTests(unittest.TestCase):
             )
         )
 
-        with self.assertRaises(RuntimeError) as raised:
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
             controller._check_runtime(
                 commanded,
-                motion_context="transition -> high",
-                motion_elapsed_s=1.25,
+                motion_context="hold low",
+                motion_elapsed_s=0.25,
+            )
+            controller._check_runtime(
+                commanded,
+                motion_context="hold low",
+                motion_elapsed_s=0.252,
             )
 
-        message = str(raised.exception)
-        self.assertIn("2/12 leg joints", message)
-        self.assertIn("during transition -> high at 1.250 s", message)
-        self.assertIn("max_abs_error=0.520000000 rad", message)
-        self.assertIn("limit=0.450000000 rad", message)
-        self.assertIn("motor[2]/q[2] FR_calf", message)
-        self.assertIn("motor[6]/q[6] RR_hip", message)
-        self.assertNotIn("motor[10]/q[10] RL_thigh", message)
-        self.assertIn("commanded-measured=-0.450100000 rad", message)
-        self.assertIn("commanded-measured=+0.520000000 rad", message)
+        warning_output = stderr.getvalue()
+        self.assertEqual(warning_output.count("WARNING: joint tracking error"), 1)
+        self.assertIn("warning=0.450 rad", warning_output)
+        self.assertIn("stop=0.550 rad", warning_output)
+        self.assertIn("RR_calf", warning_output)
+
+    def test_dry_run_does_not_create_tracking_log_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log_dir = controller_module.Path(temporary_directory) / "live-only"
+            controller = controller_module.HardwareGestureController(
+                "eth0",
+                "192.168.123.18",
+                "height",
+                tracking_log_dir=str(log_dir),
+            )
+            controller._initialize_dds = mock.Mock()
+            controller._wait_for_first_state = mock.Mock()
+            controller._check_mode = mock.Mock(return_value=("1", "ai-w"))
+            controller._capture_stable_prone = mock.Mock(
+                return_value=(list(PRONE), [0.0, 0.0, 0.0])
+            )
+
+            with mock.patch.object(
+                controller_module, "interface_ipv4", return_value="192.168.123.18"
+            ):
+                controller.run(live=False)
+
+            self.assertFalse(log_dir.exists())
+
+    def test_main_finalizes_tracking_telemetry_after_runtime_error(self):
+        controller = mock.Mock()
+        controller.run.side_effect = RuntimeError("simulated watchdog stop")
+        controller._mode_released = True
+        controller._mode_release_attempted = True
+        controller._mode_restore_attempted = False
+
+        with mock.patch.object(controller_module, "load_unitree_sdk"), mock.patch.object(
+            controller_module,
+            "HardwareGestureController",
+            return_value=controller,
+        ), mock.patch.object(controller_module.signal, "signal"):
+            exit_code = controller_module.main(
+                [
+                    "--gesture",
+                    "height",
+                    "--live",
+                    "--tracking-log-dir",
+                    "/tmp/tracking-test",
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        controller.run.assert_called_once_with(live=True)
+        controller.finalize_tracking_log.assert_called_once_with(
+            "error", error_text="simulated watchdog stop"
+        )
 
     def test_dds_write_failure_is_not_ignored(self):
         controller = controller_module.HardwareGestureController(

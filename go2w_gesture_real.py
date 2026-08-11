@@ -18,10 +18,16 @@ script; SDK2Py communicates directly over CycloneDDS.
 from __future__ import print_function
 
 import argparse
+from array import array
 from collections import deque
+import csv
 from dataclasses import dataclass
+from datetime import datetime
 import fcntl
+import json
 import math
+import os
+from pathlib import Path
 import signal
 import socket
 import struct
@@ -55,9 +61,14 @@ PRONE_MAX_WHEEL_SPEED_RAD_S = 0.50
 PRONE_MAX_TILT_RAD = 0.35
 PRONE_MAX_CALF_ANGLE_RAD = -2.20
 RUN_MAX_TILT_RAD = 0.55
-# Provisional fail-closed heuristic. This value was not derived from measured
-# hardware tracking distributions, actuator limits, or a qualified torque bound.
-RUN_MAX_TRACKING_ERROR_RAD = 0.45
+# Provisional fail-closed heuristics. These values were not derived from
+# measured hardware tracking distributions, actuator limits, or a qualified
+# torque bound. The warning preserves visibility at the old stop threshold;
+# the stop threshold allows a narrow additional diagnostic range.
+RUN_TRACKING_WARNING_RAD = 0.45
+RUN_MAX_TRACKING_ERROR_RAD = 0.55
+TRACKING_WARNING_PRINT_INTERVAL_S = 0.5
+DEFAULT_TRACKING_LOG_DIR = os.environ.get("GO2W_TRACKING_LOG_DIR", "runs")
 LOWCMD_QUIET_S = 0.5
 LOWCMD_QUIET_TIMEOUT_S = 3.0
 MODE_RELEASE_TIMEOUT_S = 10.0
@@ -330,6 +341,211 @@ class StateSample:
     rpy: List[float]
 
 
+class TrackingRecorder:
+    """Buffer live tracking samples without filesystem I/O in the 500 Hz loop."""
+
+    _ROW_WIDTH = 44
+
+    def __init__(self, log_dir, gesture, timing):
+        self.log_dir = Path(log_dir).expanduser()
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        if not self.log_dir.is_dir() or not os.access(str(self.log_dir), os.W_OK):
+            raise RuntimeError(
+                "tracking log directory is not writable: {}".format(self.log_dir)
+            )
+
+        self.gesture = gesture
+        self.timing = timing
+        self.created_at = datetime.now().astimezone()
+        self.started_at = None  # type: Optional[float]
+        self._rows = array("d")
+        self._phase_ids = array("H")
+        self._phases = []
+        self._phase_to_id = {}
+        self._phase_sample_counts = {}
+        self._per_joint_peak = [None] * 12
+        self._global_peak = None
+        self._warning_sample_count = 0
+        self._stop_sample_count = 0
+        self._max_lowstate_age_s = 0.0
+        self._finalized_paths = None
+
+    @property
+    def sample_count(self):
+        return len(self._phase_ids)
+
+    def start(self):
+        if self.started_at is None:
+            self.started_at = time.monotonic()
+
+    def record(self, sample, commanded_pose, motion_context, motion_elapsed_s):
+        if self.started_at is None:
+            self.start()
+        phase = str(motion_context or "unspecified")
+        phase_id = self._phase_to_id.get(phase)
+        if phase_id is None:
+            phase_id = len(self._phases)
+            if phase_id > 65535:
+                raise RuntimeError("too many tracking telemetry phases")
+            self._phase_to_id[phase] = phase_id
+            self._phases.append(phase)
+
+        now = time.monotonic()
+        run_elapsed_s = now - self.started_at
+        lowstate_age_s = max(0.0, now - sample.received_at)
+        phase_elapsed_s = (
+            float("nan") if motion_elapsed_s is None else float(motion_elapsed_s)
+        )
+        measured = [float(value) for value in sample.pose]
+        target = [float(value) for value in commanded_pose]
+        errors = [target[index] - measured[index] for index in range(12)]
+        max_index = max(range(12), key=lambda index: abs(errors[index]))
+        max_abs_error = abs(errors[max_index])
+
+        self._phase_ids.append(phase_id)
+        self._rows.extend(
+            [
+                run_elapsed_s,
+                phase_elapsed_s,
+                lowstate_age_s,
+                float(sample.rpy[0]),
+                float(sample.rpy[1]),
+                float(sample.rpy[2]),
+            ]
+            + measured
+            + target
+            + errors
+            + [max_abs_error, float(max_index)]
+        )
+        self._phase_sample_counts[phase] = (
+            self._phase_sample_counts.get(phase, 0) + 1
+        )
+        self._max_lowstate_age_s = max(self._max_lowstate_age_s, lowstate_age_s)
+        if max_abs_error > RUN_TRACKING_WARNING_RAD:
+            self._warning_sample_count += 1
+        if max_abs_error > RUN_MAX_TRACKING_ERROR_RAD:
+            self._stop_sample_count += 1
+
+        for index in range(12):
+            peak = self._per_joint_peak[index]
+            if peak is None or abs(errors[index]) > peak["max_abs_error_rad"]:
+                candidate = {
+                    "index": index,
+                    "name": LEG_JOINT_NAMES[index],
+                    "max_abs_error_rad": abs(errors[index]),
+                    "signed_error_rad": errors[index],
+                    "measured_rad": measured[index],
+                    "target_rad": target[index],
+                    "run_elapsed_s": run_elapsed_s,
+                    "phase": phase,
+                    "phase_elapsed_s": (
+                        None if math.isnan(phase_elapsed_s) else phase_elapsed_s
+                    ),
+                }
+                self._per_joint_peak[index] = candidate
+                if (
+                    self._global_peak is None
+                    or candidate["max_abs_error_rad"]
+                    > self._global_peak["max_abs_error_rad"]
+                ):
+                    self._global_peak = dict(candidate)
+
+        return errors, max_index
+
+    @staticmethod
+    def _csv_header():
+        header = [
+            "run_elapsed_s",
+            "phase",
+            "phase_elapsed_s",
+            "lowstate_age_s",
+            "roll_rad",
+            "pitch_rad",
+            "yaw_rad",
+        ]
+        for prefix in ("measured", "target", "error_target_minus_measured"):
+            header.extend(
+                "{}_{}_rad".format(prefix, name) for name in LEG_JOINT_NAMES
+            )
+        header.extend(
+            ["max_abs_error_rad", "max_error_joint_index", "max_error_joint_name"]
+        )
+        return header
+
+    def _unique_output_paths(self):
+        timestamp = self.created_at.strftime("%Y%m%dT%H%M%S_%f%z")
+        stem = "{}_{}_{}_tracking".format(
+            timestamp, self.gesture, self.timing.name
+        )
+        suffix = 1
+        while True:
+            candidate = stem if suffix == 1 else "{}-{}".format(stem, suffix)
+            csv_path = self.log_dir / "{}.csv".format(candidate)
+            summary_path = self.log_dir / "{}.summary.json".format(candidate)
+            if not csv_path.exists() and not summary_path.exists():
+                return csv_path, summary_path
+            suffix += 1
+
+    def finalize(self, outcome, error_text=None):
+        if self._finalized_paths is not None:
+            return self._finalized_paths
+
+        csv_path, summary_path = self._unique_output_paths()
+        with csv_path.open("x", newline="", encoding="utf-8") as output:
+            writer = csv.writer(output)
+            writer.writerow(self._csv_header())
+            for row_index, phase_id in enumerate(self._phase_ids):
+                offset = row_index * self._ROW_WIDTH
+                row = self._rows[offset : offset + self._ROW_WIDTH]
+                phase_elapsed_s = row[1]
+                max_index = int(row[43])
+                writer.writerow(
+                    [
+                        "{:.9f}".format(row[0]),
+                        self._phases[phase_id],
+                        (
+                            ""
+                            if math.isnan(phase_elapsed_s)
+                            else "{:.9f}".format(phase_elapsed_s)
+                        ),
+                    ]
+                    + ["{:.9f}".format(value) for value in row[2:43]]
+                    + [max_index, LEG_JOINT_NAMES[max_index]]
+                )
+
+        duration_s = 0.0
+        if self.sample_count:
+            duration_s = self._rows[(self.sample_count - 1) * self._ROW_WIDTH]
+        summary = {
+            "schema_version": 1,
+            "created_at": self.created_at.isoformat(),
+            "gesture": self.gesture,
+            "timing_profile": self.timing.name,
+            "transition_s": self.timing.transition_s,
+            "hold_s": self.timing.hold_s,
+            "control_period_s": CONTROL_PERIOD_S,
+            "tracking_warning_rad": RUN_TRACKING_WARNING_RAD,
+            "tracking_stop_rad": RUN_MAX_TRACKING_ERROR_RAD,
+            "outcome": str(outcome),
+            "error": None if error_text is None else str(error_text),
+            "sample_count": self.sample_count,
+            "duration_s": duration_s,
+            "max_lowstate_age_s": self._max_lowstate_age_s,
+            "warning_crossing_sample_count": self._warning_sample_count,
+            "stop_crossing_sample_count": self._stop_sample_count,
+            "samples_per_phase": self._phase_sample_counts,
+            "global_peak": self._global_peak,
+            "per_joint_peak": self._per_joint_peak,
+            "csv_file": csv_path.name,
+        }
+        with summary_path.open("x", encoding="utf-8") as output:
+            json.dump(summary, output, indent=2, sort_keys=True)
+            output.write("\n")
+
+        self._finalized_paths = (csv_path, summary_path)
+        return self._finalized_paths
+
+
 class InterruptedSequence(Exception):
     pass
 
@@ -339,7 +555,14 @@ class HardStop(Exception):
 
 
 class HardwareGestureController:
-    def __init__(self, interface, expected_ip, gesture, timing=SLOW_TIMING):
+    def __init__(
+        self,
+        interface,
+        expected_ip,
+        gesture,
+        timing=SLOW_TIMING,
+        tracking_log_dir=None,
+    ):
         if gesture not in GESTURE_NAMES:
             raise ValueError("unknown gesture: {!r}".format(gesture))
         if not isinstance(timing, GestureTimingProfile):
@@ -348,6 +571,7 @@ class HardwareGestureController:
         self.expected_ip = expected_ip
         self.gesture = gesture
         self.timing = timing
+        self.tracking_log_dir = tracking_log_dir
         self._lock = threading.Lock()
         self._samples = deque(maxlen=2000)
         self._last_lowcmd_time = None  # type: Optional[float]
@@ -370,7 +594,36 @@ class HardwareGestureController:
         self._neutralized = False
         self._ended_prone = False
         self._captured_prone = None  # type: Optional[List[float]]
+        self._tracking_recorder = None  # type: Optional[TrackingRecorder]
+        self._last_tracking_warning_print = None  # type: Optional[float]
+        self._run_outcome = "not-started"
         self._configure_neutral_command()
+
+    def _prepare_tracking_recording(self):
+        if self.tracking_log_dir is None:
+            return
+        recorder = TrackingRecorder(
+            self.tracking_log_dir,
+            self.gesture,
+            self.timing,
+        )
+        self._tracking_recorder = recorder
+        print(
+            "tracking telemetry prepared: {} (buffered in memory during motion)".format(
+                recorder.log_dir
+            ),
+            flush=True,
+        )
+
+    def finalize_tracking_log(self, outcome, error_text=None):
+        if self._tracking_recorder is None:
+            return None
+        paths = self._tracking_recorder.finalize(outcome, error_text=error_text)
+        print(
+            "tracking telemetry saved: {} and {}".format(paths[0], paths[1]),
+            flush=True,
+        )
+        return paths
 
     def request_stop(self, _signum=None, _frame=None):
         self._signal_count += 1
@@ -705,27 +958,67 @@ class HardwareGestureController:
         ):
             raise RuntimeError("rt/lowstate contains non-finite values")
 
-        max_tilt = max(abs(sample.rpy[0]), abs(sample.rpy[1]))
-        if max_tilt > RUN_MAX_TILT_RAD:
-            raise RuntimeError(
-                "body tilt watchdog triggered: {:.3f} rad > {:.3f} rad".format(
-                    max_tilt, RUN_MAX_TILT_RAD
-                )
-            )
-
         if commanded_pose is not None:
-            signed_errors = [
-                commanded_pose[index] - sample.pose[index] for index in range(12)
+            if self._tracking_recorder is not None:
+                signed_errors, max_index = self._tracking_recorder.record(
+                    sample,
+                    commanded_pose,
+                    motion_context,
+                    motion_elapsed_s,
+                )
+            else:
+                signed_errors = [
+                    commanded_pose[index] - sample.pose[index] for index in range(12)
+                ]
+                max_index = max(
+                    range(12), key=lambda index: abs(signed_errors[index])
+                )
+
+            warning_indices = [
+                index
+                for index, error in enumerate(signed_errors)
+                if abs(error) > RUN_TRACKING_WARNING_RAD
             ]
             exceeded_indices = [
                 index
                 for index, error in enumerate(signed_errors)
                 if abs(error) > RUN_MAX_TRACKING_ERROR_RAD
             ]
+            if warning_indices and not exceeded_indices:
+                now = time.monotonic()
+                if (
+                    self._last_tracking_warning_print is None
+                    or now - self._last_tracking_warning_print
+                    >= TRACKING_WARNING_PRINT_INTERVAL_S
+                ):
+                    context_text = ""
+                    if motion_context is not None:
+                        context_text = " during {}".format(motion_context)
+                        if motion_elapsed_s is not None:
+                            context_text += " at {:.3f} s".format(motion_elapsed_s)
+                    print(
+                        (
+                            "WARNING: joint tracking error: {}/12 leg joints "
+                            "exceeded warning={:.3f} rad{}; max_abs_error={:.9f} "
+                            "rad at motor[{}]/q[{}] {} (stop={:.3f} rad)"
+                        ).format(
+                            len(warning_indices),
+                            RUN_TRACKING_WARNING_RAD,
+                            context_text,
+                            abs(signed_errors[max_index]),
+                            max_index,
+                            max_index,
+                            LEG_JOINT_NAMES[max_index],
+                            RUN_MAX_TRACKING_ERROR_RAD,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._last_tracking_warning_print = now
+            elif not warning_indices:
+                self._last_tracking_warning_print = None
+
             if exceeded_indices:
-                max_index = max(
-                    range(12), key=lambda index: abs(signed_errors[index])
-                )
                 context_text = ""
                 if motion_context is not None:
                     context_text = " during {}".format(motion_context)
@@ -763,6 +1056,14 @@ class HardwareGestureController:
                         )
                     )
                 raise RuntimeError("\n".join(lines))
+
+        max_tilt = max(abs(sample.rpy[0]), abs(sample.rpy[1]))
+        if max_tilt > RUN_MAX_TILT_RAD:
+            raise RuntimeError(
+                "body tilt watchdog triggered: {:.3f} rad > {:.3f} rad".format(
+                    max_tilt, RUN_MAX_TILT_RAD
+                )
+            )
         return sample
 
     def _run_for(
@@ -1020,6 +1321,14 @@ class HardwareGestureController:
             flush=True,
         )
         print(
+            "  joint tracking: warning {:.2f} rad, stop {:.2f} rad; log directory {}".format(
+                RUN_TRACKING_WARNING_RAD,
+                RUN_MAX_TRACKING_ERROR_RAD,
+                self.tracking_log_dir,
+            ),
+            flush=True,
+        )
+        print(
             "Ensure the robot is belly-down on a flat floor, wheels are blocked, "
             "a support/spotter is present, and the hardware E-stop is held ready.",
             flush=True,
@@ -1080,6 +1389,7 @@ class HardwareGestureController:
             flush=True,
         )
         if not live:
+            self._run_outcome = "preflight-completed"
             print(
                 "DRY RUN COMPLETE: no StopMove, ReleaseMode, SelectMode, or LowCmd write was issued",
                 flush=True,
@@ -1087,6 +1397,10 @@ class HardwareGestureController:
             return
 
         self._confirm_live(mode_form, mode_name, prone_pose, rpy)
+        # Validate the host-persistent destination before changing Sport
+        # ownership. No telemetry file is written in the 500 Hz control loop.
+        self._prepare_tracking_recording()
+        self._run_outcome = "preparing-lowcmd"
 
         if mode_name:
             self._restore_mode_name = mode_name
@@ -1115,14 +1429,19 @@ class HardwareGestureController:
         self._publisher = ChannelPublisher("rt/lowcmd", LowCmd_)
         self._publisher.Init()
         self._publishing = True
+        if self._tracking_recorder is not None:
+            self._tracking_recorder.start()
+        self._run_outcome = "running"
 
         publisher_close_error = None
         try:
             self._run_selected_gesture()
         except InterruptedSequence:
+            self._run_outcome = "interrupted-controlled-return"
             self._return_prone_after_interrupt()
             self._neutralize(NEUTRAL_COMMAND_S)
         except HardStop:
+            self._run_outcome = "hard-stop"
             self._neutralize(0.25)
         finally:
             if not self._neutralized:
@@ -1178,6 +1497,8 @@ class HardwareGestureController:
                 file=sys.stderr,
                 flush=True,
             )
+        if self._run_outcome == "running":
+            self._run_outcome = "completed"
 
 
 def parse_args(argv):
@@ -1209,6 +1530,14 @@ def parse_args(argv):
         help="allow Sport release and physical LowCmd motion after TTY confirmation",
     )
     parser.add_argument(
+        "--tracking-log-dir",
+        default=DEFAULT_TRACKING_LOG_DIR,
+        help=(
+            "host-persistent directory for live CSV/JSON telemetry "
+            "(default: %(default)s; env: GO2W_TRACKING_LOG_DIR)"
+        ),
+    )
+    parser.add_argument(
         "--describe",
         action="store_true",
         help="print the sequence without importing SDK2Py or opening DDS",
@@ -1232,6 +1561,9 @@ def main(argv=None, timing=SLOW_TIMING):
         return 2
 
     controller = None
+    exit_code = 0
+    outcome = "completed"
+    error_text = None
     try:
         load_unitree_sdk()
         controller = HardwareGestureController(
@@ -1239,14 +1571,21 @@ def main(argv=None, timing=SLOW_TIMING):
             args.expected_ip,
             args.gesture,
             timing=timing,
+            tracking_log_dir=args.tracking_log_dir,
         )
         signal.signal(signal.SIGINT, controller.request_stop)
         signal.signal(signal.SIGTERM, controller.request_stop)
         controller.run(live=args.live)
-    except InterruptedSequence:
+        outcome = controller._run_outcome
+    except InterruptedSequence as error:
+        exit_code = 130
+        outcome = "interrupted-before-control"
+        error_text = str(error) or "stop requested before control ownership changed"
         print("stopped before control ownership changed", file=sys.stderr, flush=True)
-        return 130
     except (RuntimeError, ValueError) as error:
+        exit_code = 1
+        outcome = "error"
+        error_text = str(error)
         print("error: {}".format(error), file=sys.stderr, flush=True)
         if controller is not None and (
             controller._mode_released
@@ -1259,8 +1598,18 @@ def main(argv=None, timing=SLOW_TIMING):
                 file=sys.stderr,
                 flush=True,
             )
-        return 1
-    return 0
+    finally:
+        if controller is not None:
+            try:
+                controller.finalize_tracking_log(outcome, error_text=error_text)
+            except Exception as log_error:
+                print(
+                    "error: failed to save tracking telemetry: {}".format(log_error),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                exit_code = 1
+    return exit_code
 
 
 if __name__ == "__main__":
