@@ -4,23 +4,26 @@ Containerized, fail-closed low-level gesture controller for a Unitree Go2W.
 The controller talks directly to Unitree SDK2Py over CycloneDDS. It does not
 use `rclpy`, Unitree ROS 2 messages, ROS 2 Foxy, or ROS 2 Humble at runtime.
 
-The repository provides two selectable gestures and two explicit hardware
-timing scripts. Both scripts import the same fail-closed controller logic; only
-the repeated gesture transition/hold timing differs.
+The repository provides two selectable gestures, two standard hardware timing
+scripts, and one explicit diagnostic variant that does not stop on joint
+tracking error. All three scripts import the same controller logic.
 
 | Gesture | Low-level sequence |
 | --- | --- |
 | `height` | Standard, three low/high cycles, standard |
 | `roll` | Standard, three right/left cycles, standard |
 
-| Script | Timing profile | Gesture transition | Gesture hold |
-| --- | --- | --- | --- |
-| `go2w_gesture_real.py` | `slow` | 2.0 s | 2.0 s |
-| `go2w_gesture_real_fast.py` | `fast` | 1.0 s | 0.5 s |
+| Script | Timing profile | Gesture transition | Gesture hold | Joint tracking-error stop |
+| --- | --- | --- | --- | --- |
+| `go2w_gesture_real.py` | `slow` | 2.0 s | 2.0 s | Above 0.55 rad |
+| `go2w_gesture_real_fast.py` | `fast` | 1.0 s | 0.5 s | Above 0.55 rad |
+| `go2w_gesture_real_no_tracking_stop.py` | `slow` | 2.0 s | 2.0 s | Disabled |
 
-Every live gesture shares the same control-ownership checks, watchdogs,
-captured-prone shutdown, explicit confirmation boundary, and conditional Sport
-Mode restoration.
+Every live gesture shares the same control-ownership checks, captured-prone
+shutdown, explicit confirmation boundary, and conditional Sport Mode
+restoration. The diagnostic variant disables only the joint tracking-error
+stop; LowState freshness, finite-state, body-tilt, DDS-write, and ownership
+watchdogs remain active.
 
 ## Clone, build, and inspect
 
@@ -33,7 +36,7 @@ make describe
 ```
 
 `make build`, `make test`, and `make describe` do not connect to the robot.
-`make describe` prints both timing profiles.
+`make describe` prints both timing profiles and the no-tracking-stop policy.
 
 ## Deployment assumptions
 
@@ -111,6 +114,13 @@ make preflight-fast-height
 make preflight-fast-roll
 ```
 
+Slow diagnostic profile without a joint tracking-error stop:
+
+```bash
+make preflight-no-tracking-stop-height
+make preflight-no-tracking-stop-roll
+```
+
 The existing `make preflight-height` and `make preflight-roll` names remain
 aliases for the slow profile.
 
@@ -139,6 +149,13 @@ Fast height and roll gestures:
 ```bash
 make live-fast-height
 make live-fast-roll
+```
+
+Slow height and roll gestures without a joint tracking-error stop:
+
+```bash
+make live-no-tracking-stop-height
+make live-no-tracking-stop-roll
 ```
 
 The required typed confirmation depends on the gesture, not the timing
@@ -200,7 +217,7 @@ sequence is unit-tested but remains unqualified on physical Go2W hardware.
 
 ## Runtime watchdogs
 
-The live controller fails closed on:
+The standard slow and fast controllers fail closed on:
 
 - stale or non-finite LowState;
 - body roll/pitch above `0.55 rad` (about 31.5 degrees);
@@ -223,6 +240,13 @@ without removing the independent application-level stop. Do not treat either
 number as a certified limit. Raising or removing the stop allows larger
 commanded-versus-measured errors, larger potential PD effort and contact loads,
 and a longer loss-of-tracking interval before LowCmd is neutralized.
+
+`go2w_gesture_real_no_tracking_stop.py` is the separately named slow diagnostic
+variant for runs where tracking-error telemetry must not terminate the gesture.
+It still prints throttled warnings above `0.45 rad` and records all 12 leg
+joints, but it never stops solely because the target-minus-measured joint error
+is large. The independent `0.55 rad` body roll/pitch watchdog remains enabled.
+Its live confirmation explicitly reports `tracking-error stop disabled`.
 
 The pinned Unitree SDK2Py API accepts and publishes the requested `q`, `dq`,
 `kp`, `kd`, and `tau` fields. Unitree's public SDK examples do not document an
@@ -252,9 +276,10 @@ application exception such as the tracking watchdog, `main()` writes two files
 under the host repository's `runs/` directory:
 
 - `*_tracking.csv`: one row per runtime check, including the row that crossed
-  the stop threshold;
-- `*_tracking.summary.json`: outcome/error text, thresholds, sample counts,
-  samples per phase, the global peak, and each joint's peak error.
+  the stop threshold for the standard scripts;
+- `*_tracking.summary.json`: outcome/error text, whether the tracking stop was
+  enabled, thresholds, sample counts, samples per phase, the global peak, and
+  each joint's peak error.
 
 Each CSV row contains the run and phase time, phase name, LowState sample age,
 IMU roll/pitch/yaw, and, for every joint from `FR_hip` through `RL_calf`, the

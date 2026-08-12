@@ -10,6 +10,7 @@ from unittest import mock
 
 import go2w_gesture_real as controller_module
 import go2w_gesture_real_fast as fast_module
+import go2w_gesture_real_no_tracking_stop as no_tracking_stop_module
 
 
 PRONE = [0.0, 1.36, -2.65] * 4
@@ -260,6 +261,51 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("warning=0.450 rad", warning_output)
         self.assertIn("stop=0.550 rad", warning_output)
         self.assertIn("RR_calf", warning_output)
+
+    def test_no_tracking_stop_records_large_error_without_stopping(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller = controller_module.HardwareGestureController(
+                "eth0",
+                "192.168.123.18",
+                "height",
+                tracking_log_dir=temporary_directory,
+                tracking_stop_rad=None,
+            )
+            controller._prepare_tracking_recording()
+            controller._tracking_recorder.start()
+            commanded = list(controller_module.STANDARD)
+            measured = list(commanded)
+            measured[5] += 0.80
+            controller._latest_sample = mock.Mock(
+                return_value=controller_module.StateSample(
+                    received_at=time.monotonic(),
+                    pose=measured,
+                    leg_velocity=[0.0] * 12,
+                    wheel_velocity=[0.0] * 4,
+                    rpy=[0.0, 0.0, 0.0],
+                )
+            )
+
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                controller._check_runtime(
+                    commanded,
+                    motion_context="transition -> high",
+                    motion_elapsed_s=0.75,
+                )
+
+            self.assertIn("stop disabled", stderr.getvalue())
+            csv_path, summary_path = controller.finalize_tracking_log("completed")
+            self.assertIn("no-tracking-stop", csv_path.name)
+            with summary_path.open(encoding="utf-8") as input_file:
+                summary = json.load(input_file)
+            self.assertFalse(summary["tracking_stop_enabled"])
+            self.assertIsNone(summary["tracking_stop_rad"])
+            self.assertEqual(summary["stop_crossing_sample_count"], 0)
+            self.assertEqual(summary["warning_crossing_sample_count"], 1)
+            self.assertAlmostEqual(
+                summary["global_peak"]["max_abs_error_rad"], 0.80
+            )
 
     def test_dry_run_does_not_create_tracking_log_directory(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -572,6 +618,18 @@ class ControllerTests(unittest.TestCase):
 
         controller_main.assert_called_once_with(
             ["--describe"], timing=controller_module.FAST_TIMING
+        )
+
+    def test_no_tracking_stop_script_selects_slow_profile_without_stop(self):
+        with mock.patch.object(
+            no_tracking_stop_module, "controller_main", return_value=0
+        ) as controller_main:
+            self.assertEqual(no_tracking_stop_module.main(["--describe"]), 0)
+
+        controller_main.assert_called_once_with(
+            ["--describe"],
+            timing=controller_module.SLOW_TIMING,
+            tracking_stop_rad=None,
         )
 
     def test_fast_profile_applies_to_height_and_roll_cycles(self):

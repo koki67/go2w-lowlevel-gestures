@@ -332,6 +332,21 @@ def print_sequence_plan(gesture=None, timing=SLOW_TIMING):
         raise ValueError("unknown gesture: {!r}".format(gesture))
 
 
+def print_tracking_policy(tracking_stop_rad):
+    if tracking_stop_rad is None:
+        print(
+            "Joint tracking policy: warn and record above {:.2f} rad; "
+            "tracking-error stop disabled".format(RUN_TRACKING_WARNING_RAD)
+        )
+    else:
+        print(
+            "Joint tracking policy: warn above {:.2f} rad; stop above {:.2f} rad".format(
+                RUN_TRACKING_WARNING_RAD,
+                tracking_stop_rad,
+            )
+        )
+
+
 @dataclass
 class StateSample:
     received_at: float
@@ -346,7 +361,13 @@ class TrackingRecorder:
 
     _ROW_WIDTH = 44
 
-    def __init__(self, log_dir, gesture, timing):
+    def __init__(
+        self,
+        log_dir,
+        gesture,
+        timing,
+        tracking_stop_rad=RUN_MAX_TRACKING_ERROR_RAD,
+    ):
         self.log_dir = Path(log_dir).expanduser()
         self.log_dir.mkdir(parents=True, exist_ok=True)
         if not self.log_dir.is_dir() or not os.access(str(self.log_dir), os.W_OK):
@@ -356,6 +377,7 @@ class TrackingRecorder:
 
         self.gesture = gesture
         self.timing = timing
+        self.tracking_stop_rad = tracking_stop_rad
         self.created_at = datetime.now().astimezone()
         self.started_at = None  # type: Optional[float]
         self._rows = array("d")
@@ -423,7 +445,10 @@ class TrackingRecorder:
         self._max_lowstate_age_s = max(self._max_lowstate_age_s, lowstate_age_s)
         if max_abs_error > RUN_TRACKING_WARNING_RAD:
             self._warning_sample_count += 1
-        if max_abs_error > RUN_MAX_TRACKING_ERROR_RAD:
+        if (
+            self.tracking_stop_rad is not None
+            and max_abs_error > self.tracking_stop_rad
+        ):
             self._stop_sample_count += 1
 
         for index in range(12):
@@ -474,9 +499,12 @@ class TrackingRecorder:
 
     def _unique_output_paths(self):
         timestamp = self.created_at.strftime("%Y%m%dT%H%M%S_%f%z")
-        stem = "{}_{}_{}_tracking".format(
-            timestamp, self.gesture, self.timing.name
+        policy_name = (
+            self.timing.name
+            if self.tracking_stop_rad is not None
+            else "{}_no-tracking-stop".format(self.timing.name)
         )
+        stem = "{}_{}_{}_tracking".format(timestamp, self.gesture, policy_name)
         suffix = 1
         while True:
             candidate = stem if suffix == 1 else "{}-{}".format(stem, suffix)
@@ -525,7 +553,8 @@ class TrackingRecorder:
             "hold_s": self.timing.hold_s,
             "control_period_s": CONTROL_PERIOD_S,
             "tracking_warning_rad": RUN_TRACKING_WARNING_RAD,
-            "tracking_stop_rad": RUN_MAX_TRACKING_ERROR_RAD,
+            "tracking_stop_enabled": self.tracking_stop_rad is not None,
+            "tracking_stop_rad": self.tracking_stop_rad,
             "outcome": str(outcome),
             "error": None if error_text is None else str(error_text),
             "sample_count": self.sample_count,
@@ -562,16 +591,24 @@ class HardwareGestureController:
         gesture,
         timing=SLOW_TIMING,
         tracking_log_dir=None,
+        tracking_stop_rad=RUN_MAX_TRACKING_ERROR_RAD,
     ):
         if gesture not in GESTURE_NAMES:
             raise ValueError("unknown gesture: {!r}".format(gesture))
         if not isinstance(timing, GestureTimingProfile):
             raise ValueError("invalid timing profile: {!r}".format(timing))
+        if tracking_stop_rad is not None and (
+            not math.isfinite(tracking_stop_rad) or tracking_stop_rad <= 0.0
+        ):
+            raise ValueError(
+                "tracking stop threshold must be a positive finite value or None"
+            )
         self.interface = interface
         self.expected_ip = expected_ip
         self.gesture = gesture
         self.timing = timing
         self.tracking_log_dir = tracking_log_dir
+        self.tracking_stop_rad = tracking_stop_rad
         self._lock = threading.Lock()
         self._samples = deque(maxlen=2000)
         self._last_lowcmd_time = None  # type: Optional[float]
@@ -606,6 +643,7 @@ class HardwareGestureController:
             self.tracking_log_dir,
             self.gesture,
             self.timing,
+            tracking_stop_rad=self.tracking_stop_rad,
         )
         self._tracking_recorder = recorder
         print(
@@ -979,11 +1017,15 @@ class HardwareGestureController:
                 for index, error in enumerate(signed_errors)
                 if abs(error) > RUN_TRACKING_WARNING_RAD
             ]
-            exceeded_indices = [
-                index
-                for index, error in enumerate(signed_errors)
-                if abs(error) > RUN_MAX_TRACKING_ERROR_RAD
-            ]
+            exceeded_indices = (
+                []
+                if self.tracking_stop_rad is None
+                else [
+                    index
+                    for index, error in enumerate(signed_errors)
+                    if abs(error) > self.tracking_stop_rad
+                ]
+            )
             if warning_indices and not exceeded_indices:
                 now = time.monotonic()
                 if (
@@ -996,11 +1038,16 @@ class HardwareGestureController:
                         context_text = " during {}".format(motion_context)
                         if motion_elapsed_s is not None:
                             context_text += " at {:.3f} s".format(motion_elapsed_s)
+                    stop_text = (
+                        "stop disabled"
+                        if self.tracking_stop_rad is None
+                        else "stop={:.3f} rad".format(self.tracking_stop_rad)
+                    )
                     print(
                         (
                             "WARNING: joint tracking error: {}/12 leg joints "
                             "exceeded warning={:.3f} rad{}; max_abs_error={:.9f} "
-                            "rad at motor[{}]/q[{}] {} (stop={:.3f} rad)"
+                            "rad at motor[{}]/q[{}] {} ({})"
                         ).format(
                             len(warning_indices),
                             RUN_TRACKING_WARNING_RAD,
@@ -1009,7 +1056,7 @@ class HardwareGestureController:
                             max_index,
                             max_index,
                             LEG_JOINT_NAMES[max_index],
-                            RUN_MAX_TRACKING_ERROR_RAD,
+                            stop_text,
                         ),
                         file=sys.stderr,
                         flush=True,
@@ -1036,7 +1083,7 @@ class HardwareGestureController:
                         max_index,
                         max_index,
                         LEG_JOINT_NAMES[max_index],
-                        RUN_MAX_TRACKING_ERROR_RAD,
+                        self.tracking_stop_rad,
                     )
                 ]
                 for index in exceeded_indices:
@@ -1320,14 +1367,25 @@ class HardwareGestureController:
             ),
             flush=True,
         )
+        tracking_stop_text = (
+            "disabled"
+            if self.tracking_stop_rad is None
+            else "{:.2f} rad".format(self.tracking_stop_rad)
+        )
         print(
-            "  joint tracking: warning {:.2f} rad, stop {:.2f} rad; log directory {}".format(
+            "  joint tracking: warning {:.2f} rad, stop {}; log directory {}".format(
                 RUN_TRACKING_WARNING_RAD,
-                RUN_MAX_TRACKING_ERROR_RAD,
+                tracking_stop_text,
                 self.tracking_log_dir,
             ),
             flush=True,
         )
+        if self.tracking_stop_rad is None:
+            print(
+                "  WARNING: joint tracking error is recorded but cannot stop this run.",
+                file=sys.stderr,
+                flush=True,
+            )
         print(
             "Ensure the robot is belly-down on a flat floor, wheels are blocked, "
             "a support/spotter is present, and the hardware E-stop is held ready.",
@@ -1382,6 +1440,7 @@ class HardwareGestureController:
         prone_pose, rpy = self._capture_stable_prone()
 
         print_sequence_plan(self.gesture, self.timing)
+        print_tracking_policy(self.tracking_stop_rad)
         print(
             "read-only preflight: form={!r}, active mode={!r}, stable prone pose confirmed".format(
                 mode_form, mode_name
@@ -1545,12 +1604,23 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def main(argv=None, timing=SLOW_TIMING):
+def main(
+    argv=None,
+    timing=SLOW_TIMING,
+    tracking_stop_rad=RUN_MAX_TRACKING_ERROR_RAD,
+):
     if not isinstance(timing, GestureTimingProfile):
         raise ValueError("invalid timing profile: {!r}".format(timing))
+    if tracking_stop_rad is not None and (
+        not math.isfinite(tracking_stop_rad) or tracking_stop_rad <= 0.0
+    ):
+        raise ValueError(
+            "tracking stop threshold must be a positive finite value or None"
+        )
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.describe:
         print_sequence_plan(args.gesture, timing)
+        print_tracking_policy(tracking_stop_rad)
         return 0
     if args.gesture is None:
         print(
@@ -1572,6 +1642,7 @@ def main(argv=None, timing=SLOW_TIMING):
             args.gesture,
             timing=timing,
             tracking_log_dir=args.tracking_log_dir,
+            tracking_stop_rad=tracking_stop_rad,
         )
         signal.signal(signal.SIGINT, controller.request_stop)
         signal.signal(signal.SIGTERM, controller.request_stop)

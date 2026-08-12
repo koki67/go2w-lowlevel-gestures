@@ -68,11 +68,13 @@ RUN python3 -m venv /opt/venv \
 WORKDIR /app
 COPY go2w_gesture_real.py /app/go2w_gesture_real.py
 COPY go2w_gesture_real_fast.py /app/go2w_gesture_real_fast.py
+COPY go2w_gesture_real_no_tracking_stop.py /app/go2w_gesture_real_no_tracking_stop.py
 COPY tests /app/tests
 
 RUN python -m unittest discover -s /app/tests -v \
     && python /app/go2w_gesture_real.py --describe \
-    && python /app/go2w_gesture_real_fast.py --describe
+    && python /app/go2w_gesture_real_fast.py --describe \
+    && python /app/go2w_gesture_real_no_tracking_stop.py --describe
 
 
 FROM ubuntu:22.04 AS runtime
