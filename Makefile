@@ -4,19 +4,23 @@ PYTHON := /opt/venv/bin/python
 SLOW_SCRIPT := /app/go2w_gesture_real.py
 FAST_SCRIPT := /app/go2w_gesture_real_fast.py
 NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_no_tracking_stop.py
+FAST_NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_fast_no_tracking_stop.py
 
 .PHONY: help build test clean describe \
 	describe-slow describe-slow-height describe-slow-roll \
 	describe-fast describe-fast-height describe-fast-roll \
 	describe-no-tracking-stop describe-no-tracking-stop-height describe-no-tracking-stop-roll \
+	describe-fast-no-tracking-stop describe-fast-no-tracking-stop-height describe-fast-no-tracking-stop-roll \
 	describe-height describe-roll \
 	preflight-slow-height preflight-slow-roll \
 	preflight-fast-height preflight-fast-roll \
 	preflight-no-tracking-stop-height preflight-no-tracking-stop-roll \
+	preflight-fast-no-tracking-stop-height preflight-fast-no-tracking-stop-roll \
 	preflight-height preflight-roll \
 	live-slow-height live-slow-roll \
 	live-fast-height live-fast-roll \
 	live-no-tracking-stop-height live-no-tracking-stop-roll \
+	live-fast-no-tracking-stop-height live-fast-no-tracking-stop-roll \
 	live-height live-roll
 
 help:
@@ -27,12 +31,14 @@ help:
 	@echo "Fast 1.0/0.5 physical:  make live-fast-height | live-fast-roll"
 	@echo "Slow 2.0/2.0, no tracking-error stop: make preflight-no-tracking-stop-height | preflight-no-tracking-stop-roll"
 	@echo "Slow 2.0/2.0, no tracking-error stop: make live-no-tracking-stop-height | live-no-tracking-stop-roll"
+	@echo "Fast 1.0/0.5, no tracking-error stop: make preflight-fast-no-tracking-stop-height | preflight-fast-no-tracking-stop-roll"
+	@echo "Fast 1.0/0.5, no tracking-error stop: make live-fast-no-tracking-stop-height | live-fast-no-tracking-stop-roll"
 	@echo "Compatibility: preflight-height/roll and live-height/roll use slow"
 
 build:
 	$(COMPOSE) build --pull
 
-describe: describe-slow describe-fast describe-no-tracking-stop
+describe: describe-slow describe-fast describe-no-tracking-stop describe-fast-no-tracking-stop
 
 describe-slow:
 	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
@@ -70,6 +76,18 @@ describe-no-tracking-stop-roll:
 	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
 		$(SERVICE) $(NO_TRACKING_STOP_SCRIPT) --gesture roll --describe
 
+describe-fast-no-tracking-stop:
+	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
+		$(SERVICE) $(FAST_NO_TRACKING_STOP_SCRIPT) --describe
+
+describe-fast-no-tracking-stop-height:
+	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
+		$(SERVICE) $(FAST_NO_TRACKING_STOP_SCRIPT) --gesture height --describe
+
+describe-fast-no-tracking-stop-roll:
+	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
+		$(SERVICE) $(FAST_NO_TRACKING_STOP_SCRIPT) --gesture roll --describe
+
 describe-height: describe-slow-height
 
 describe-roll: describe-slow-roll
@@ -103,6 +121,14 @@ preflight-no-tracking-stop-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
 		$(SERVICE) $(NO_TRACKING_STOP_SCRIPT) --gesture roll
 
+preflight-fast-no-tracking-stop-height:
+	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+		$(SERVICE) $(FAST_NO_TRACKING_STOP_SCRIPT) --gesture height
+
+preflight-fast-no-tracking-stop-roll:
+	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+		$(SERVICE) $(FAST_NO_TRACKING_STOP_SCRIPT) --gesture roll
+
 preflight-height: preflight-slow-height
 
 preflight-roll: preflight-slow-roll
@@ -130,6 +156,14 @@ live-no-tracking-stop-height:
 live-no-tracking-stop-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
 		$(SERVICE) $(NO_TRACKING_STOP_SCRIPT) --gesture roll --live
+
+live-fast-no-tracking-stop-height:
+	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+		$(SERVICE) $(FAST_NO_TRACKING_STOP_SCRIPT) --gesture height --live
+
+live-fast-no-tracking-stop-roll:
+	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+		$(SERVICE) $(FAST_NO_TRACKING_STOP_SCRIPT) --gesture roll --live
 
 live-height: live-slow-height
 

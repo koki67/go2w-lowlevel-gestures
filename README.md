@@ -4,9 +4,10 @@ Containerized, fail-closed low-level gesture controller for a Unitree Go2W.
 The controller talks directly to Unitree SDK2Py over CycloneDDS. It does not
 use `rclpy`, Unitree ROS 2 messages, ROS 2 Foxy, or ROS 2 Humble at runtime.
 
-The repository provides two selectable gestures, two standard hardware timing
-scripts, and one explicit diagnostic variant that does not stop on joint
-tracking error. All three scripts import the same controller logic.
+The repository provides two selectable gestures and four explicit hardware
+profiles: slow/fast timing, each with either the standard joint-tracking stop
+or a diagnostic no-tracking-stop policy. All scripts import the same controller
+logic.
 
 | Gesture | Low-level sequence |
 | --- | --- |
@@ -18,6 +19,7 @@ tracking error. All three scripts import the same controller logic.
 | `go2w_gesture_real.py` | `slow` | 2.0 s | 2.0 s | Above 0.55 rad |
 | `go2w_gesture_real_fast.py` | `fast` | 1.0 s | 0.5 s | Above 0.55 rad |
 | `go2w_gesture_real_no_tracking_stop.py` | `slow` | 2.0 s | 2.0 s | Disabled |
+| `go2w_gesture_real_fast_no_tracking_stop.py` | `fast` | 1.0 s | 0.5 s | Disabled |
 
 Every live gesture shares the same control-ownership checks, captured-prone
 shutdown, explicit confirmation boundary, and conditional Sport Mode
@@ -36,7 +38,7 @@ make describe
 ```
 
 `make build`, `make test`, and `make describe` do not connect to the robot.
-`make describe` prints both timing profiles and the no-tracking-stop policy.
+`make describe` prints all four timing/watchdog combinations.
 
 ## Deployment assumptions
 
@@ -58,10 +60,10 @@ but sourcing a ROS environment is not required.
 
 ## Gesture definitions
 
-The profile timing applies to the repeated low/high or right/left motions. Both
-scripts retain the safer common startup and shutdown timing: captured prone to
-standard is 2.0 s with a 2.0 s hold, standard recovery is 2.0 s with a 2.0 s
-hold, and return to captured prone is 3.0 s with a 2.0 s hold.
+The profile timing applies to the repeated low/high or right/left motions. All
+four profiles retain the safer common startup and shutdown timing: captured
+prone to standard is 2.0 s with a 2.0 s hold, standard recovery is 2.0 s with a
+2.0 s hold, and return to captured prone is 3.0 s with a 2.0 s hold.
 
 ### Height
 
@@ -121,6 +123,13 @@ make preflight-no-tracking-stop-height
 make preflight-no-tracking-stop-roll
 ```
 
+Fast diagnostic profile without a joint tracking-error stop:
+
+```bash
+make preflight-fast-no-tracking-stop-height
+make preflight-fast-no-tracking-stop-roll
+```
+
 The existing `make preflight-height` and `make preflight-roll` names remain
 aliases for the slow profile.
 
@@ -156,6 +165,13 @@ Slow height and roll gestures without a joint tracking-error stop:
 ```bash
 make live-no-tracking-stop-height
 make live-no-tracking-stop-roll
+```
+
+Fast height and roll gestures without a joint tracking-error stop:
+
+```bash
+make live-fast-no-tracking-stop-height
+make live-fast-no-tracking-stop-roll
 ```
 
 The required typed confirmation depends on the gesture, not the timing
@@ -241,12 +257,14 @@ number as a certified limit. Raising or removing the stop allows larger
 commanded-versus-measured errors, larger potential PD effort and contact loads,
 and a longer loss-of-tracking interval before LowCmd is neutralized.
 
-`go2w_gesture_real_no_tracking_stop.py` is the separately named slow diagnostic
-variant for runs where tracking-error telemetry must not terminate the gesture.
-It still prints throttled warnings above `0.45 rad` and records all 12 leg
-joints, but it never stops solely because the target-minus-measured joint error
-is large. The independent `0.55 rad` body roll/pitch watchdog remains enabled.
-Its live confirmation explicitly reports `tracking-error stop disabled`.
+`go2w_gesture_real_no_tracking_stop.py` and
+`go2w_gesture_real_fast_no_tracking_stop.py` are the separately named slow and
+fast diagnostic variants for runs where tracking-error telemetry must not
+terminate the gesture. They still print throttled warnings above `0.45 rad`
+and record all 12 leg joints, but never stop solely because the
+target-minus-measured joint error is large. The independent `0.55 rad` body
+roll/pitch watchdog remains enabled. Their live confirmation explicitly
+reports `tracking-error stop disabled`.
 
 The pinned Unitree SDK2Py API accepts and publishes the requested `q`, `dq`,
 `kp`, `kd`, and `tau` fields. Unitree's public SDK examples do not document an
@@ -332,6 +350,8 @@ hierarchy; the checkout itself is not patched.
   live attempts stopped on the former provisional `0.45 rad` stop threshold.
   The new `0.45 rad` warning / `0.55 rad` stop policy and live telemetry remain
   unqualified; the full sequence remains unqualified.
+- Slow and fast no-tracking-stop variants: implemented and unit-tested, but not
+  yet physically qualified through a full Go2W sequence.
 - Go2W roll hardware motion: not yet performed.
 - Automatic Sport Mode restoration after a confirmed prone return: implemented
   and unit-tested, but not yet physically qualified on Go2W hardware.

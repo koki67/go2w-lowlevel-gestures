@@ -10,6 +10,7 @@ from unittest import mock
 
 import go2w_gesture_real as controller_module
 import go2w_gesture_real_fast as fast_module
+import go2w_gesture_real_fast_no_tracking_stop as fast_no_tracking_stop_module
 import go2w_gesture_real_no_tracking_stop as no_tracking_stop_module
 
 
@@ -629,6 +630,21 @@ class ControllerTests(unittest.TestCase):
         controller_main.assert_called_once_with(
             ["--describe"],
             timing=controller_module.SLOW_TIMING,
+            tracking_stop_rad=None,
+        )
+
+    def test_fast_no_tracking_stop_script_selects_fast_profile_without_stop(self):
+        with mock.patch.object(
+            fast_no_tracking_stop_module, "controller_main", return_value=0
+        ) as controller_main:
+            self.assertEqual(
+                fast_no_tracking_stop_module.main(["--describe"]),
+                0,
+            )
+
+        controller_main.assert_called_once_with(
+            ["--describe"],
+            timing=controller_module.FAST_TIMING,
             tracking_stop_rad=None,
         )
 
