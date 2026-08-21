@@ -70,13 +70,17 @@ COPY go2w_gesture_real.py /app/go2w_gesture_real.py
 COPY go2w_gesture_real_fast.py /app/go2w_gesture_real_fast.py
 COPY go2w_gesture_real_no_tracking_stop.py /app/go2w_gesture_real_no_tracking_stop.py
 COPY go2w_gesture_real_fast_no_tracking_stop.py /app/go2w_gesture_real_fast_no_tracking_stop.py
+COPY simulation /app/simulation
 COPY tests /app/tests
 
 RUN python -m unittest discover -s /app/tests -v \
     && python /app/go2w_gesture_real.py --describe \
     && python /app/go2w_gesture_real_fast.py --describe \
     && python /app/go2w_gesture_real_no_tracking_stop.py --describe \
-    && python /app/go2w_gesture_real_fast_no_tracking_stop.py --describe
+    && python /app/go2w_gesture_real_fast_no_tracking_stop.py --describe \
+    && python /app/simulation/go2w_height_sequence_sim.py --describe \
+    && python /app/simulation/go2w_roll_sequence_sim.py --describe \
+    && python /app/simulation/go2w_low_to_high_sequence_sim.py --describe
 
 
 FROM ubuntu:22.04 AS runtime

@@ -4,10 +4,10 @@ Containerized, fail-closed low-level gesture controller for a Unitree Go2W.
 The controller talks directly to Unitree SDK2Py over CycloneDDS. It does not
 use `rclpy`, Unitree ROS 2 messages, ROS 2 Foxy, or ROS 2 Humble at runtime.
 
-The repository provides two selectable gestures and four explicit hardware
-profiles: slow/fast timing, each with either the standard joint-tracking stop
-or a diagnostic no-tracking-stop policy. All scripts import the same controller
-logic.
+The repository owns both sides of the gesture definition: four explicit
+hardware profiles and MuJoCo simulation controllers for the same height and
+roll targets. The MuJoCo engine and Go2W model remain an external dependency;
+they are not vendored into this repository.
 
 | Gesture | Low-level sequence |
 | --- | --- |
@@ -93,6 +93,64 @@ The roll gesture deliberately uses 70% of that value: `0.66304 rad` (about
 The MuJoCo run reached approximately `+27.7/-27.6 degrees` of measured body
 roll without falling and returned close to level. This is simulation evidence,
 not Go2W hardware qualification.
+
+## MuJoCo simulation
+
+The simulation controller code and flat-scene definition live in this
+repository under `simulation/`. A built `unitree_mujoco` checkout supplies the
+simulator executable, Go2W MJCF/assets, and a Python environment containing
+`unitree_sdk2py`. This keeps the gesture implementation beside the hardware
+controller without copying or forking the upstream simulator.
+
+By default, Make expects the repositories to be siblings:
+
+```text
+~/ws/go2w-lowlevel-gestures
+~/ws/unitree_mujoco
+```
+
+The external checkout must provide:
+
+- `simulate/build/unitree_mujoco`;
+- `unitree_robots/go2w/go2w.xml` and its `assets/` directory; and
+- `simulate_python/.venv/bin/python` with `unitree_sdk2py` importable.
+
+Check those requirements without opening MuJoCo:
+
+```bash
+make sim-doctor
+make sim-describe
+```
+
+For a checkout elsewhere, override the root. The Python executable may also be
+overridden independently:
+
+```bash
+make sim-doctor UNITREE_MUJOCO_ROOT=/path/to/unitree_mujoco
+make sim-doctor \
+  UNITREE_MUJOCO_ROOT=/path/to/unitree_mujoco \
+  UNITREE_MUJOCO_PYTHON=/path/to/python
+```
+
+Launch the flat-scene GUI and the selected low-level controller from this
+repository:
+
+```bash
+make sim-height
+make sim-roll
+make sim-low-to-high
+```
+
+Each command fixes DDS to domain `0` on loopback (`lo`), refuses to start if a
+simulator or LowCmd publisher is already active there, starts and owns the
+MuJoCo child process, and stops it on `Ctrl+C`. The repository-owned flat scene
+is assembled in a temporary directory with links to the external Go2W model;
+the external checkout is not modified at runtime. Joint-tracking SVGs are
+written under `runs/mujoco/` and remain ignored generated output.
+
+The external checkout's `simulate/config.yaml` and
+`simulate_python/config.py` do not need to be changed: robot, scene, DDS domain,
+and interface are supplied explicitly by the launcher.
 
 ## Read-only robot preflight
 
@@ -341,9 +399,10 @@ hierarchy; the checkout itself is not patched.
 ## Qualification status
 
 - Non-hardware unit and command-generation tests: included in every image build.
-- Height MuJoCo motion: validated separately.
-- Roll MuJoCo motion: validated at 70% URDF-derived hip offset and 0.75 s
-  transitions.
+- Height MuJoCo motion: simulation code and launcher included; motion validated
+  with the external `unitree_mujoco` runtime.
+- Roll MuJoCo motion: simulation code and launcher included; validated at 70%
+  URDF-derived hip offset and 0.75 s transitions.
 - Jetson `aarch64` image build and live startup: exercised; actual 500 Hz loop
   rate and jitter remain unmeasured.
 - Go2W height hardware motion: both fast `1.0/0.5 s` and slow `2.0/2.0 s`

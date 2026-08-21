@@ -5,6 +5,12 @@ SLOW_SCRIPT := /app/go2w_gesture_real.py
 FAST_SCRIPT := /app/go2w_gesture_real_fast.py
 NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_no_tracking_stop.py
 FAST_NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_fast_no_tracking_stop.py
+HOST_PYTHON ?= python3
+UNITREE_MUJOCO_ROOT ?= $(abspath ../unitree_mujoco)
+UNITREE_MUJOCO_PYTHON ?= $(UNITREE_MUJOCO_ROOT)/simulate_python/.venv/bin/python
+SIM_ENV := UNITREE_MUJOCO_ROOT='$(UNITREE_MUJOCO_ROOT)' \
+	UNITREE_MUJOCO_PYTHON='$(UNITREE_MUJOCO_PYTHON)'
+SIM_DIR := simulation
 
 .PHONY: help build test clean describe \
 	describe-slow describe-slow-height describe-slow-roll \
@@ -21,7 +27,9 @@ FAST_NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_fast_no_tracking_stop.py
 	live-fast-height live-fast-roll \
 	live-no-tracking-stop-height live-no-tracking-stop-roll \
 	live-fast-no-tracking-stop-height live-fast-no-tracking-stop-roll \
-	live-height live-roll
+	live-height live-roll \
+	sim-doctor sim-describe sim-describe-height sim-describe-roll \
+	sim-describe-low-to-high sim-height sim-roll sim-low-to-high
 
 help:
 	@echo "Non-hardware: make build | test | describe"
@@ -34,6 +42,8 @@ help:
 	@echo "Fast 1.0/0.5, no tracking-error stop: make preflight-fast-no-tracking-stop-height | preflight-fast-no-tracking-stop-roll"
 	@echo "Fast 1.0/0.5, no tracking-error stop: make live-fast-no-tracking-stop-height | live-fast-no-tracking-stop-roll"
 	@echo "Compatibility: preflight-height/roll and live-height/roll use slow"
+	@echo "MuJoCo requirement check: make sim-doctor"
+	@echo "MuJoCo runs (external unitree_mujoco): make sim-height | sim-roll | sim-low-to-high"
 
 build:
 	$(COMPOSE) build --pull
@@ -96,6 +106,29 @@ test:
 	$(COMPOSE) run --rm --no-deps -T \
 		--entrypoint /opt/venv/bin/python $(SERVICE) \
 		-m unittest discover -s /app/tests -v
+
+sim-doctor:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_height_sequence_sim.py --doctor
+
+sim-describe: sim-describe-height sim-describe-roll sim-describe-low-to-high
+
+sim-describe-height:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_height_sequence_sim.py --describe
+
+sim-describe-roll:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_roll_sequence_sim.py --describe
+
+sim-describe-low-to-high:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_low_to_high_sequence_sim.py --describe
+
+sim-height:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_height_sequence_sim.py
+
+sim-roll:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_roll_sequence_sim.py
+
+sim-low-to-high:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_low_to_high_sequence_sim.py
 
 preflight-slow-height:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
