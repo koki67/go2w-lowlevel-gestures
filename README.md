@@ -4,10 +4,10 @@ Containerized, fail-closed low-level gesture controller for a Unitree Go2W.
 The controller talks directly to Unitree SDK2Py over CycloneDDS. It does not
 use `rclpy`, Unitree ROS 2 messages, ROS 2 Foxy, or ROS 2 Humble at runtime.
 
-The repository owns both sides of the gesture definition: four explicit
-hardware profiles and MuJoCo simulation controllers for the same height and
-roll targets. The MuJoCo engine and Go2W model remain an external dependency;
-they are not vendored into this repository.
+The repository owns both sides of the gesture definition: the four original
+hardware profiles, two closed-loop controllers, and MuJoCo controllers for the
+same height and roll targets. The MuJoCo engine and Go2W model remain an
+external dependency; they are not vendored into this repository.
 
 | Gesture | Low-level sequence |
 | --- | --- |
@@ -20,6 +20,8 @@ they are not vendored into this repository.
 | `go2w_gesture_real_fast.py` | `fast` | 1.0 s | 0.5 s | Above 0.55 rad |
 | `go2w_gesture_real_no_tracking_stop.py` | `slow` | 2.0 s | 2.0 s | Disabled |
 | `go2w_gesture_real_fast_no_tracking_stop.py` | `fast` | 1.0 s | 0.5 s | Disabled |
+| `go2w_gesture_real_adaptive.py` | adaptive joint-space | 1.0 s nominal | 0.5 s minimum | Adaptive envelopes plus 0.55 rad stop |
+| `go2w_gesture_real_wbc.py` | quasi-static kinematic WBC | 1.0 s nominal | 0.5 s minimum | Adaptive envelopes plus 0.55 rad stop |
 
 Every live gesture shares the same control-ownership checks, captured-prone
 shutdown, explicit confirmation boundary, and conditional Sport Mode
@@ -38,7 +40,9 @@ make describe
 ```
 
 `make build`, `make test`, and `make describe` do not connect to the robot.
-`make describe` prints all four timing/watchdog combinations.
+`make describe` preserves the original timing/watchdog descriptions. Use the
+explicit `describe-adaptive-*` and `describe-wbc-*` targets for the new
+closed-loop controllers.
 
 ## Deployment assumptions
 
@@ -94,6 +98,62 @@ The MuJoCo run reached approximately `+27.7/-27.6 degrees` of measured body
 roll without falling and returned close to level. This is simulation evidence,
 not Go2W hardware qualification.
 
+## Closed-loop controllers
+
+`go2w_gesture_real_adaptive.py` keeps the existing joint targets and 500 Hz
+position-PD command path, but replaces time-only phase progression with a
+reference governor. Command-versus-measurement envelopes are `0.18 rad` for
+hip, `0.14 rad` for thigh, and `0.25 rad` for calf joints. Progress runs at the
+scheduled speed through 50% of an envelope, slows linearly from 50% to 90%,
+and stops at 90%. A 100% breach sustained for 0.10 s requests a controlled
+captured-prone return. A phase completes only after all joints are within the
+50% convergence gate and maximum joint speed is at most `0.20 rad/s` for
+0.30 s. Wall timeouts are 8 s for a repeated transition, 12 s for startup, and
+15 s for the prone return.
+
+`go2w_gesture_real_wbc.py` uses the same adaptive startup and return. During
+the gesture it solves a 100 Hz constrained kinematic QP for
+`[base twist 6, leg dq 12]`, integrates a bounded position reference, and
+resends that reference through the existing 500 Hz position PD. It keeps every
+LowCmd `tau` field at zero. This is a quasi-static kinematic WBC, not a
+direct-torque dynamic WBC, and it is not intended for jumps, fast contact
+switches, or dynamic gaits.
+
+The WBC target offsets relative to the captured STANDARD state are:
+
+| Gesture endpoint | Task-space target |
+| --- | --- |
+| Height low | `-0.093178 m` |
+| Height high | `+0.076281 m` |
+| Roll right | `-0.395469 rad` (about `-22.659 degrees`) |
+| Roll left | `+0.395469 rad` (about `+22.659 degrees`) |
+
+Roll and pitch come from the IMU. Relative height comes from leg kinematics
+and estimated wheel loads; it is not claimed as absolute world height. Contact
+loads are estimated from the audited model, actuator-sign `tau_est`, external
+gravity, and `J(q)^T f`. The forces are accepted only when the QP status,
+Jacobian conditioning, torque fit, force/moment balance, total vertical load,
+and every positive wheel load pass continuously for 0.5 s. Go2W `foot_force`
+is not used as a valid sensor input. On hardware, the WBC also holds STANDARD
+at 500 Hz while a separate input thread requires:
+
+```text
+FOUR WHEELS LOADED AND BELLY CLEAR
+```
+
+Both closed-loop controllers apply provisional application protections at 60%
+(warning), 75% (stop progress), 85% for 0.10 s (controlled return), and 100%
+(immediate error) of the audited model torque ranges. These thresholds are not
+actuator certification values. They also stop on stale/non-finite state, mode
+changes, increases in `lost`, tilt, DDS failures, solver failure, and timing
+failure. Temperature and power are recorded but have no invented absolute stop
+threshold. Neither controller retries automatically or falls back to a
+no-tracking-stop script.
+
+The first physical trial is intentionally configured for the full task target
+and all three cycles, following the selected test protocol. That is riskier
+than an amplitude ramp and does not weaken any watchdog or confirmation gate.
+
 ## MuJoCo simulation
 
 The simulation controller code and flat-scene definition live in this
@@ -131,6 +191,29 @@ make sim-doctor \
   UNITREE_MUJOCO_ROOT=/path/to/unitree_mujoco \
   UNITREE_MUJOCO_PYTHON=/path/to/python
 ```
+
+The closed-loop qualification harness uses pinned NumPy/SciPy/OSQP in an
+isolated `/tmp` target so it does not modify the external simulator checkout or
+its virtual environment. Prepare it once, inspect the contract, and run the
+four controller/gesture combinations:
+
+```bash
+make sim-closed-loop-deps
+make sim-closed-loop-doctor
+make sim-closed-loop-describe
+make sim-adaptive-height
+make sim-adaptive-roll
+make sim-wbc-height
+make sim-wbc-roll
+```
+
+Each target runs three cycles from normal, asymmetric-prone, and
+belly-loaded-prone preparation states. The controller receives only joint
+position/velocity, actuator torque, and IMU-equivalent inputs. Simulator base
+pose, contacts, and actuator force are evaluation-only. JSON summaries are
+written under `runs/mujoco/closed-loop/`; a nonzero result is retained as
+qualification evidence rather than bypassed. These headless results are
+simulation qualification only.
 
 Launch the flat-scene GUI and the selected low-level controller from this
 repository:
@@ -210,6 +293,15 @@ make preflight-fast-no-tracking-stop-height
 make preflight-fast-no-tracking-stop-roll
 ```
 
+Closed-loop read-only preflights:
+
+```bash
+make preflight-adaptive-height
+make preflight-adaptive-roll
+make preflight-wbc-height
+make preflight-wbc-roll
+```
+
 The existing `make preflight-height` and `make preflight-roll` names remain
 aliases for the slow profile.
 
@@ -219,7 +311,9 @@ wheel velocities, IMU tilt, current Sport-service state, and selected gesture
 targets. An empty service name is reported as an already-released state rather
 than rejected.
 It does **not** call `StopMove()`, `ReleaseMode()`, `SelectMode()`, or publish
-`LowCmd`.
+`LowCmd`. In particular, a WBC preflight does not run its contact QP or request
+the four-wheel confirmation because those occur only after controlled STANDARD
+has been reached during a confirmed live run.
 
 ## Live hardware execution
 
@@ -252,6 +346,16 @@ Fast height and roll gestures without a joint tracking-error stop:
 ```bash
 make live-fast-no-tracking-stop-height
 make live-fast-no-tracking-stop-roll
+```
+
+Closed-loop live targets exist explicitly, but the first physical evaluation
+must use the qualification runner in the next section:
+
+```bash
+make live-adaptive-height
+make live-adaptive-roll
+make live-wbc-height
+make live-wbc-roll
 ```
 
 The required typed confirmation depends on the gesture, not the timing
@@ -288,6 +392,40 @@ The live ownership sequence is common to both gestures:
 
 There is intentionally no ambiguous `make live` target. The gesture name must
 be part of the command and is shown again before confirmation.
+
+## Jetson qualification runner
+
+The four `qualify-live-*` targets fail closed on a dirty worktree, wrong branch
+or SHA, non-`aarch64` host, NIC/IP mismatch, build failure, test failure,
+`pip check` failure, describe failure, or read-only preflight failure. They do
+not stash, reset, delete, retry, select another gesture, or invoke a
+no-tracking-stop fallback.
+
+After the desktop-qualified feature commit has been pushed, run these on the
+Jetson in this exact order, replacing `<desktop-qualified-sha>` with the full
+40-character SHA:
+
+```bash
+cd /home/unitree/go2w-lowlevel-gestures
+make qualify-live-adaptive-height QUALIFIED_SHA=<desktop-qualified-sha>
+make qualify-live-adaptive-roll QUALIFIED_SHA=<desktop-qualified-sha>
+make qualify-live-wbc-height QUALIFIED_SHA=<desktop-qualified-sha>
+make qualify-live-wbc-roll QUALIFIED_SHA=<desktop-qualified-sha>
+```
+
+Before each live child starts, the runner prints a Japanese physical checklist
+and requires a controller/gesture-specific phrase. The underlying controller
+then retains its existing ownership confirmation; WBC adds its second
+four-wheel/belly-clear confirmation while continuing the 500 Hz STANDARD hold.
+Stop the remaining cases after any firmware error, E-stop, watchdog,
+controlled-return failure, or unconfirmed Sport restoration.
+
+Artifacts are isolated under `runs/qualification/<timestamp>/`: Git SHA,
+commands, stage exit codes, terminal log, controller CSV/summary files, runner
+summary, and SHA-256 manifest. The runner leaves `physical_pass` false for
+manual review; a process exit code alone cannot establish safe physical
+behavior. Invoking the runner directly without `--live` performs the software
+pipeline and never calls a live Make target.
 
 ## Sport Mode restoration boundary
 
@@ -387,6 +525,14 @@ separate true tracking lag from delayed state delivery, while differences in
 `run_elapsed_s` expose loop-timing gaps. Logs are not created by `--describe`
 or the read-only preflight.
 
+Adaptive and WBC live runs also write a controller-labelled closed-loop CSV and
+summary JSON. They add `dq`, 16-motor `tau_est`/mode/lost/temperature, IMU gyro
+and acceleration, power, phase progress, speed scale, and publication deadline
+misses. WBC rows additionally include task target/estimate, per-wheel estimated
+force, balance and torque residuals, solver status/iterations/residuals, solve
+time, and contact-velocity residual. The 500 Hz controller only appends rows in
+memory; files are finalized after command publication stops.
+
 List the newest files on the Jetson after a run:
 
 ```bash
@@ -409,6 +555,8 @@ The Docker build downloads and verifies exact upstream commits:
 | CycloneDDS Python binding | `0.10.2` |
 | Unitree SDK2Py | `a035adeaa6f8ea171bef9a43e8477abb87a0b35e` |
 | NumPy | `1.26.4` |
+| SciPy | `1.13.1` |
+| OSQP | `1.1.3` |
 | OpenCV Python | `4.10.0.84` |
 
 The Unitree checkout contains CRC libraries for both `x86_64` and `aarch64`.
@@ -433,6 +581,13 @@ hierarchy; the checkout itself is not patched.
   unqualified; the full sequence remains unqualified.
 - Slow and fast no-tracking-stop variants: implemented and unit-tested, but not
   yet physically qualified through a full Go2W sequence.
+- Adaptive joint-space and quasi-static WBC controllers: implemented with
+  unit/contract coverage. The generated closed-loop MuJoCo summaries are the
+  authority for each controller/gesture/initial-condition result; a failed
+  case is not converted into a pass by documentation.
+- Closed-loop Jetson software qualification and the four full-amplitude,
+  three-cycle physical cases: not yet completed. Until all four are reviewed
+  as passing, the feature branch must not be merged into `main`.
 - Go2W roll hardware motion: not yet performed.
 - Automatic Sport Mode restoration after a confirmed prone return: implemented
   and unit-tested, but not yet physically qualified on Go2W hardware.

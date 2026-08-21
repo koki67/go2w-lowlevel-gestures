@@ -179,6 +179,62 @@ class ClosedLoopTelemetryRecorder:
         for row in self.rows:
             phase = row["phase"]
             phase_counts[phase] = phase_counts.get(phase, 0) + 1
+
+        def finite_values(key):
+            values = []
+            for row in self.rows:
+                try:
+                    value = float(row.get(key, ""))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value):
+                    values.append(value)
+            return values
+
+        def range_summary(key):
+            values = finite_values(key)
+            if not values:
+                return {"minimum": None, "maximum": None}
+            return {"minimum": min(values), "maximum": max(values)}
+
+        temperature_ranges = {}
+        for index in range(16):
+            name = (
+                base.LEG_JOINT_NAMES[index]
+                if index < 12
+                else "{}_wheel".format(base.LEG_JOINT_NAMES[(index - 12) * 3][:2])
+            )
+            temperature_ranges[name] = range_summary(
+                "temperature_{}_raw".format(name)
+            )
+
+        qp_solve_times = finite_values("wbc_qp_solve_time_s")
+        task_height_errors = [
+            abs(target - measured)
+            for target, measured in zip(
+                finite_values("task_target_relative_height_m"),
+                finite_values("task_measured_relative_height_m"),
+            )
+        ]
+        task_roll_errors = [
+            abs(target - measured)
+            for target, measured in zip(
+                finite_values("task_target_roll_rad"),
+                finite_values("task_measured_roll_rad"),
+            )
+        ]
+        task_pitch_errors = [
+            abs(target - measured)
+            for target, measured in zip(
+                finite_values("task_target_pitch_rad"),
+                finite_values("task_measured_pitch_rad"),
+            )
+        ]
+        qp_status_counts = {}
+        for row in self.rows:
+            status = str(row.get("wbc_qp_status", "")).strip()
+            if status:
+                qp_status_counts[status] = qp_status_counts.get(status, 0) + 1
         summary = {
             "schema_version": 1,
             "created_at": self.created_at.isoformat(),
@@ -201,6 +257,43 @@ class ClosedLoopTelemetryRecorder:
                 (int(row["consecutive_deadline_misses"]) for row in self.rows),
                 default=0,
             ),
+            "temperature_raw_by_motor": temperature_ranges,
+            "power_v": range_summary("power_v"),
+            "power_a": range_summary("power_a"),
+            "wbc": {
+                "qp_solve_count": len(qp_solve_times),
+                "qp_solve_p99_s": (
+                    float(np.percentile(qp_solve_times, 99))
+                    if qp_solve_times
+                    else None
+                ),
+                "qp_solve_max_s": max(qp_solve_times) if qp_solve_times else None,
+                "qp_status_counts": qp_status_counts,
+                "max_qp_iterations": max(
+                    finite_values("wbc_qp_iterations"), default=None
+                ),
+                "max_contact_torque_residual_ratio": max(
+                    finite_values("contact_torque_residual_ratio"), default=None
+                ),
+                "max_contact_balance_residual_ratio": max(
+                    finite_values("contact_balance_residual_ratio"), default=None
+                ),
+                "minimum_contact_normal_load_n": min(
+                    finite_values("contact_minimum_normal_load_n"), default=None
+                ),
+                "max_contact_velocity_residual_m_s": max(
+                    finite_values("wbc_contact_velocity_residual_m_s"), default=None
+                ),
+                "max_abs_task_height_error_m": max(
+                    task_height_errors, default=None
+                ),
+                "max_abs_task_roll_error_rad": max(
+                    task_roll_errors, default=None
+                ),
+                "max_abs_task_pitch_error_rad": max(
+                    task_pitch_errors, default=None
+                ),
+            },
             "provisional_tau_policy": {
                 "warning_ratio": closed_loop.TORQUE_WARN_RATIO,
                 "progress_stop_ratio": closed_loop.TORQUE_STOP_RATIO,
@@ -322,6 +415,17 @@ class AdaptiveGestureController(base.HardwareGestureController):
             raise RuntimeError(
                 "tau_est reached 100% of the model torque range; immediate stop"
             )
+
+    def _validate_preflight_state(self):
+        """Fail read-only preflight if closed-loop inputs are unavailable."""
+
+        sample = self._latest_sample()
+        if sample is None or time.monotonic() - sample.received_at > base.LOWSTATE_TIMEOUT_S:
+            raise RuntimeError(
+                "extended LowState is stale during closed-loop preflight"
+            )
+        self._capture_extended_baseline()
+        self._check_extended_runtime(sample)
 
     def _record_closed_loop(
         self,

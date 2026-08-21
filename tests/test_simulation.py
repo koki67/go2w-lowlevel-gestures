@@ -16,6 +16,7 @@ import go2w_height_sequence_sim as height
 import go2w_quick_stand_sequence_sim as quick_stand
 import go2w_roll_sequence_sim as roll
 import go2w_shake_off_sequence_sim as shake_off
+import go2w_closed_loop_sequence_sim as closed_loop
 
 
 class SimulationContractTests(unittest.TestCase):
@@ -139,6 +140,135 @@ class SimulationContractTests(unittest.TestCase):
                 self.assertEqual((scene_dir / "assets").resolve(), assets)
                 self.assertFalse((model_dir / "scene_flat.xml").exists())
                 controller._scene_workspace.cleanup()
+
+    def test_closed_loop_matrix_covers_both_controllers_gestures_and_three_initials(self):
+        self.assertEqual(closed_loop.CONTROLLERS, ("adaptive", "wbc"))
+        self.assertEqual(closed_loop.GESTURES, ("height", "roll"))
+        self.assertEqual(
+            closed_loop.INITIAL_CONDITIONS,
+            ("normal", "asymmetric-prone", "belly-loaded-prone"),
+        )
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "closed-loop",
+                "--controller",
+                "wbc",
+                "--gesture",
+                "roll",
+                "--initial",
+                "all",
+            ],
+        ):
+            args = closed_loop.parse_args()
+        self.assertEqual(args.controller, "wbc")
+        self.assertEqual(args.gesture, "roll")
+        self.assertEqual(args.initial, "all")
+
+    def test_closed_loop_controller_state_uses_imu_sensor_not_ground_truth_pose(self):
+        source = Path(closed_loop.__file__).read_text(encoding="utf-8")
+        state_source = source[
+            source.index("    def state(self):") : source.index(
+                "    def imu_gyro(self):"
+            )
+        ]
+        truth_source = source[
+            source.index("    def ground_truth(self):") : source.index(
+                "    def _update_metrics(self, q_ref):"
+            )
+        ]
+        self.assertIn("sensor[48:52]", state_source)
+        self.assertNotIn("self.data.xquat", state_source)
+        self.assertIn("xquat", truth_source)
+
+    def test_closed_loop_summary_never_claims_physical_qualification(self):
+        harness = object.__new__(closed_loop.HeadlessHarness)
+        harness.initial_condition = "normal"
+        harness.cycles_completed = 0
+        harness.max_tracking_ratio = 0.0
+        harness.max_abs_tracking_error_rad = 0.0
+        harness.max_tau_ratio = 0.0
+        harness.max_controller_tilt_rad = 0.0
+        harness.max_ground_truth_tilt_rad = 0.0
+        harness.min_ground_truth_wheel_contacts = 4
+        harness.min_wbc_ground_truth_wheel_contacts = 4
+        harness.max_contact_balance_ratio = 0.0
+        harness.max_contact_velocity_residual_m_s = 0.0
+        harness.qp_solve_times = []
+        harness.hold_endpoints = []
+        harness.phase_records = []
+        harness.controlled_return_attempted = False
+        harness.controlled_return_succeeded = False
+        harness.controlled_return_error = None
+        harness.state = mock.Mock(
+            return_value=(
+                __import__("numpy").zeros(12),
+                __import__("numpy").zeros(12),
+                __import__("numpy").zeros(12),
+                [0.0, 0.0, 0.0],
+            )
+        )
+        harness.ground_truth = mock.Mock(return_value={})
+        numpy = __import__("numpy")
+        with mock.patch.object(closed_loop, "np", numpy):
+            summary = harness.summary(
+                "adaptive", "height", [0.0] * 12, error="not run"
+            )
+        self.assertFalse(summary["simulation_pass"])
+        self.assertFalse(summary["physical_pass"])
+        self.assertEqual(summary["qualification_scope"], "simulation-only")
+
+    def test_closed_loop_failure_attempts_adaptive_captured_prone_return(self):
+        class FakeHarness:
+            def __init__(self, initial_condition):
+                self.initial_condition = initial_condition
+                self.controlled_return_attempted = False
+                self.controlled_return_succeeded = False
+                self.controlled_return_error = None
+                self.return_phases = []
+
+            def prepare(self):
+                return [0.0] * 12
+
+            def adaptive_sequence(self, _gesture, _captured):
+                raise closed_loop.SimulationFailure("test stop")
+
+            def state(self):
+                return (__import__("numpy").zeros(12),) * 3 + ([0.0] * 3,)
+
+            def adaptive_phase(
+                self, name, _source, target, _duration, _timeout, **_kwargs
+            ):
+                self.return_phases.append(name)
+                return __import__("numpy").asarray(target, dtype=float)
+
+            def summary(self, _controller, _gesture, _captured, error=None):
+                return {
+                    "error": error,
+                    "controlled_return_attempted": self.controlled_return_attempted,
+                    "controlled_return_succeeded": self.controlled_return_succeeded,
+                    "return_phases": self.return_phases,
+                }
+
+            def close(self):
+                pass
+
+        import go2w_closed_loop_control as control_kernel
+
+        with (
+            mock.patch.object(closed_loop, "HeadlessHarness", FakeHarness),
+            mock.patch.object(closed_loop, "control", control_kernel),
+            mock.patch.object(closed_loop, "hardware", hardware),
+        ):
+            summary = closed_loop.run_case("adaptive", "height", "normal")
+        self.assertIn("test stop", summary["error"])
+        self.assertTrue(summary["controlled_return_attempted"])
+        self.assertTrue(summary["controlled_return_succeeded"])
+        self.assertEqual(
+            summary["return_phases"],
+            ["failure-return-captured-prone", "failure-hold-captured-prone"],
+        )
 
 
 if __name__ == "__main__":

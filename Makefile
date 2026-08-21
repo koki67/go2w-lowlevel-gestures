@@ -7,19 +7,26 @@ NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_no_tracking_stop.py
 FAST_NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_fast_no_tracking_stop.py
 ADAPTIVE_SCRIPT := /app/go2w_gesture_real_adaptive.py
 WBC_SCRIPT := /app/go2w_gesture_real_wbc.py
+QUALIFIER := qualification/go2w_qualify_live.py
 HOST_PYTHON ?= python3
+TRACKING_LOG_DIR ?= runs
+QUALIFIED_SHA ?=
+QUALIFY_ARGS ?=
 UNITREE_MUJOCO_ROOT ?= $(abspath ../unitree_mujoco)
 UNITREE_MUJOCO_PYTHON ?= $(UNITREE_MUJOCO_ROOT)/simulate_python/.venv/bin/python
 SIM_ENV := UNITREE_MUJOCO_ROOT='$(UNITREE_MUJOCO_ROOT)' \
 	UNITREE_MUJOCO_PYTHON='$(UNITREE_MUJOCO_PYTHON)'
 SIM_DIR := simulation
+CLOSED_LOOP_SIM_DEPS ?= /tmp/go2w-closed-loop-sim-deps
+CLOSED_LOOP_SIM_ENV := $(SIM_ENV) \
+	PYTHONPATH='$(CLOSED_LOOP_SIM_DEPS):$(CURDIR)'
 SIM_ARGS ?=
 SIM_RUN_ARGS := $(SIM_ARGS)
 ifneq ($(filter save-plot,$(MAKECMDGOALS)),)
 SIM_RUN_ARGS += --save-plot
 endif
 
-.PHONY: help build test clean describe \
+.PHONY: help build test pip-check clean describe \
 	describe-slow describe-slow-height describe-slow-roll \
 	describe-fast describe-fast-height describe-fast-roll \
 	describe-no-tracking-stop describe-no-tracking-stop-height describe-no-tracking-stop-roll \
@@ -40,9 +47,13 @@ endif
 	live-fast-no-tracking-stop-height live-fast-no-tracking-stop-roll \
 	live-adaptive-height live-adaptive-roll \
 	live-wbc-height live-wbc-roll \
+	qualify-live-adaptive-height qualify-live-adaptive-roll \
+	qualify-live-wbc-height qualify-live-wbc-roll \
 	live-height live-roll \
 	sim-doctor sim-describe sim-describe-height sim-describe-roll \
 	sim-describe-quick-stand sim-describe-shake-off \
+	sim-closed-loop-deps sim-closed-loop-doctor sim-closed-loop-describe \
+	sim-adaptive-height sim-adaptive-roll sim-wbc-height sim-wbc-roll \
 	sim-height sim-roll sim-quick-stand sim-shake-off save-plot
 
 help:
@@ -59,9 +70,11 @@ help:
 	@echo "Adaptive fast physical:  make live-adaptive-height | live-adaptive-roll"
 	@echo "Quasi-static WBC read-only: make preflight-wbc-height | preflight-wbc-roll"
 	@echo "Quasi-static WBC physical:  make live-wbc-height | live-wbc-roll"
+	@echo "Jetson qualification: make qualify-live-adaptive-height QUALIFIED_SHA=<sha> (and the other 3 cases)"
 	@echo "Compatibility: preflight-height/roll and live-height/roll use slow"
 	@echo "MuJoCo requirement check: make sim-doctor"
 	@echo "MuJoCo runs: make sim-height | sim-roll | sim-quick-stand | sim-shake-off"
+	@echo "Closed-loop MuJoCo: make sim-closed-loop-deps, then sim-adaptive-height | sim-adaptive-roll | sim-wbc-height | sim-wbc-roll"
 	@echo "Quick stand: low -> high in 0.1 s (simulation only)"
 	@echo "Shake off: 8 rapid right/left cycles (simulation only)"
 	@echo "Save a MuJoCo joint plot: make sim-height save-plot"
@@ -144,6 +157,10 @@ test:
 		--entrypoint /opt/venv/bin/python $(SERVICE) \
 		-m unittest discover -s /app/tests -v
 
+pip-check:
+	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
+		$(SERVICE) -m pip check
+
 sim-doctor:
 	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_height_sequence_sim.py --doctor
 
@@ -173,6 +190,39 @@ sim-quick-stand:
 
 sim-shake-off:
 	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_shake_off_sequence_sim.py $(SIM_RUN_ARGS)
+
+sim-closed-loop-deps:
+	mkdir -p '$(CLOSED_LOOP_SIM_DEPS)'
+	'$(UNITREE_MUJOCO_PYTHON)' -m pip install --upgrade \
+		--target '$(CLOSED_LOOP_SIM_DEPS)' \
+		numpy==1.26.4 scipy==1.13.1 osqp==1.1.3
+
+sim-closed-loop-doctor:
+	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
+		$(SIM_DIR)/go2w_closed_loop_sequence_sim.py --doctor
+
+sim-closed-loop-describe:
+	$(HOST_PYTHON) $(SIM_DIR)/go2w_closed_loop_sequence_sim.py --describe
+
+sim-adaptive-height:
+	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
+		$(SIM_DIR)/go2w_closed_loop_sequence_sim.py \
+		--controller adaptive --gesture height --initial all $(SIM_ARGS)
+
+sim-adaptive-roll:
+	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
+		$(SIM_DIR)/go2w_closed_loop_sequence_sim.py \
+		--controller adaptive --gesture roll --initial all $(SIM_ARGS)
+
+sim-wbc-height:
+	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
+		$(SIM_DIR)/go2w_closed_loop_sequence_sim.py \
+		--controller wbc --gesture height --initial all $(SIM_ARGS)
+
+sim-wbc-roll:
+	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
+		$(SIM_DIR)/go2w_closed_loop_sequence_sim.py \
+		--controller wbc --gesture roll --initial all $(SIM_ARGS)
 
 save-plot:
 	@:
@@ -263,19 +313,39 @@ live-fast-no-tracking-stop-roll:
 
 live-adaptive-height:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
-		$(SERVICE) $(ADAPTIVE_SCRIPT) --gesture height --live
+		$(SERVICE) $(ADAPTIVE_SCRIPT) --gesture height --live \
+		--tracking-log-dir '$(TRACKING_LOG_DIR)'
 
 live-adaptive-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
-		$(SERVICE) $(ADAPTIVE_SCRIPT) --gesture roll --live
+		$(SERVICE) $(ADAPTIVE_SCRIPT) --gesture roll --live \
+		--tracking-log-dir '$(TRACKING_LOG_DIR)'
 
 live-wbc-height:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
-		$(SERVICE) $(WBC_SCRIPT) --gesture height --live
+		$(SERVICE) $(WBC_SCRIPT) --gesture height --live \
+		--tracking-log-dir '$(TRACKING_LOG_DIR)'
 
 live-wbc-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
-		$(SERVICE) $(WBC_SCRIPT) --gesture roll --live
+		$(SERVICE) $(WBC_SCRIPT) --gesture roll --live \
+		--tracking-log-dir '$(TRACKING_LOG_DIR)'
+
+qualify-live-adaptive-height:
+	$(HOST_PYTHON) $(QUALIFIER) --controller adaptive --gesture height \
+		--expected-sha '$(QUALIFIED_SHA)' --live $(QUALIFY_ARGS)
+
+qualify-live-adaptive-roll:
+	$(HOST_PYTHON) $(QUALIFIER) --controller adaptive --gesture roll \
+		--expected-sha '$(QUALIFIED_SHA)' --live $(QUALIFY_ARGS)
+
+qualify-live-wbc-height:
+	$(HOST_PYTHON) $(QUALIFIER) --controller wbc --gesture height \
+		--expected-sha '$(QUALIFIED_SHA)' --live $(QUALIFY_ARGS)
+
+qualify-live-wbc-roll:
+	$(HOST_PYTHON) $(QUALIFIER) --controller wbc --gesture roll \
+		--expected-sha '$(QUALIFIED_SHA)' --live $(QUALIFY_ARGS)
 
 live-height: live-slow-height
 

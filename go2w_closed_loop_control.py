@@ -88,6 +88,7 @@ THIGH_LENGTH_M = 0.213
 CALF_TO_WHEEL_M = 0.2264
 
 BASE_MASS_KG = 6.921
+BASE_COM_M = np.asarray([0.021112, 0.0, -0.005366], dtype=float)
 HIP_MASS_KG = 0.678
 THIGH_MASS_KG = 1.152
 CALF_MASS_KG = 0.241352
@@ -104,6 +105,9 @@ PRONE_RETURN_TIMEOUT_S = 15.0
 HOLD_CONVERGENCE_TIMEOUT_S = 5.0
 CONVERGENCE_DWELL_S = 0.30
 MAX_CONVERGED_DQ_RAD_S = 0.20
+# One milliradian prevents quantization and floating-point boundary chatter at
+# exactly 50% without changing the command safety envelope or speed schedule.
+CONVERGENCE_NUMERIC_MARGIN_RAD = 0.001
 
 TORQUE_WARN_RATIO = 0.60
 TORQUE_STOP_RATIO = 0.75
@@ -115,9 +119,17 @@ WBC_PERIOD_S = 0.010
 WBC_MAX_DQ_RAD_S = 1.0
 WBC_MAX_DDQ_RAD_S2 = 4.0
 WBC_MAX_SOLVE_S = 0.010
-WBC_MAX_ITER = 200
+# The initial acceleration-limited QP can need roughly 300 ADMM iterations to
+# meet the strict residual bounds from a cold start.  The fixed ceiling remains
+# comfortably inside the separately enforced 10 ms wall-time limit.
+WBC_MAX_ITER = 1000
 WBC_EPS_ABS = 1.0e-5
 WBC_EPS_REL = 1.0e-5
+# Acceptance is checked independently of OSQP's scaled stopping test.  The
+# 5e-4 fixed bound rejects materially inaccurate solutions while avoiding a
+# false trip at the 1e-4 floating-point boundary seen after warm starts.
+WBC_MAX_PRIMAL_RESIDUAL = 5.0e-4
+WBC_MAX_DUAL_RESIDUAL = 5.0e-4
 
 
 def _vector(values: Sequence[float], length: int, name: str) -> np.ndarray:
@@ -276,9 +288,12 @@ class ReferenceGovernor:
             )
             self.current_ref = smooth_path(self.source, self.target, self.progress)
 
-        within_convergence = tracking_ratio <= 0.50 and float(
-            np.max(np.abs(velocity))
-        ) <= MAX_CONVERGED_DQ_RAD_S
+        within_convergence = bool(
+            np.all(
+                np.abs(self.current_ref - measured)
+                <= 0.50 * self.envelopes + CONVERGENCE_NUMERIC_MARGIN_RAD
+            )
+        ) and float(np.max(np.abs(velocity))) <= MAX_CONVERGED_DQ_RAD_S
         self._settled_s = self._settled_s + dt_s if within_convergence else 0.0
         if self._settled_s >= CONVERGENCE_DWELL_S:
             self.last_converged_ref = self.current_ref.copy()
@@ -321,7 +336,12 @@ class ConvergenceGate:
         velocity = _vector(measured_dq, 12, "measured_dq")
         tracking_ratio = float(np.max(np.abs(target - measured) / self.envelopes))
         converged = (
-            tracking_ratio <= 0.50
+            bool(
+                np.all(
+                    np.abs(target - measured)
+                    <= 0.50 * self.envelopes + CONVERGENCE_NUMERIC_MARGIN_RAD
+                )
+            )
             and float(np.max(np.abs(velocity))) <= MAX_CONVERGED_DQ_RAD_S
         )
         self.accumulated_s = self.accumulated_s + dt_s if converged else 0.0
@@ -426,7 +446,12 @@ class TaskProgressGovernor:
             self.progress >= 1.0
             and bool(task_within_tolerance)
             and float(np.max(np.abs(velocity))) <= MAX_CONVERGED_DQ_RAD_S
-            and tracking_ratio <= 0.50
+            and bool(
+                np.all(
+                    np.abs(command - measured)
+                    <= 0.50 * self.envelopes + CONVERGENCE_NUMERIC_MARGIN_RAD
+                )
+            )
         )
         self._settled_s = self._settled_s + dt_s if settled else 0.0
         completed = self._settled_s >= CONVERGENCE_DWELL_S
@@ -566,13 +591,24 @@ def _leg_com_positions(q_leg: np.ndarray, leg_index: int) -> tuple[np.ndarray, .
     )
 
 
-def gravity_torques(q: Sequence[float]) -> np.ndarray:
-    """Return model generalized gravity torque for the 12 leg joints."""
+def gravity_torques(
+    q: Sequence[float], body_rpy: Sequence[float] = (0.0, 0.0, 0.0)
+) -> np.ndarray:
+    """Return the external generalized gravity torque on the 12 leg joints.
+
+    This is the torque applied *to the robot* by gravity, rather than the
+    opposite-sign motor compensation torque.  Keeping that distinction
+    explicit matters when ``tau_est`` follows the Unitree/MuJoCo actuator
+    convention.
+    """
 
     q_array = _vector(q, 12, "q")
+    rotation = rpy_rotation(body_rpy)
     result = np.zeros(12, dtype=float)
     masses = (HIP_MASS_KG, THIGH_MASS_KG, CALF_MASS_KG, WHEEL_MASS_KG)
-    force_direction = np.asarray([0.0, 0.0, -GRAVITY_M_S2])
+    # Link geometry is expressed in the body frame.  Rotate world gravity into
+    # that frame so roll/pitch gestures do not look like contact inconsistency.
+    force_direction = rotation.T @ np.asarray([0.0, 0.0, -GRAVITY_M_S2])
     for leg in range(4):
         q_leg = q_array[3 * leg : 3 * leg + 3]
         kinematics = leg_kinematics(q_leg, leg)
@@ -587,6 +623,22 @@ def gravity_torques(q: Sequence[float]) -> np.ndarray:
                 torque += float(np.dot(kinematics.joint_axes[joint], moment))
             result[3 * leg + joint] = torque
     return result
+
+
+def whole_body_com(q: Sequence[float]) -> np.ndarray:
+    """Return the audited model's whole-body COM in the base frame."""
+
+    q_array = _vector(q, 12, "q")
+    weighted_position = BASE_MASS_KG * BASE_COM_M
+    for leg in range(4):
+        q_leg = q_array[3 * leg : 3 * leg + 3]
+        coms = _leg_com_positions(q_leg, leg)
+        for mass, position in zip(
+            (HIP_MASS_KG, THIGH_MASS_KG, CALF_MASS_KG, WHEEL_MASS_KG),
+            coms,
+        ):
+            weighted_position = weighted_position + mass * position
+    return weighted_position / MODEL_MASS_KG
 
 
 def skew(vector: Sequence[float]) -> np.ndarray:
@@ -628,36 +680,78 @@ class ContactEstimate:
 def estimate_contact_forces(
     q: Sequence[float],
     tau_est: Sequence[float],
+    body_rpy: Sequence[float] = (0.0, 0.0, 0.0),
     *,
     body_weight_n: float = BODY_WEIGHT_N,
     max_jacobian_condition: float = 200.0,
 ) -> ContactEstimate:
-    """Estimate four 3D wheel forces with a nonnegative-normal OSQP problem."""
+    """Estimate ground-on-wheel forces with a nonnegative-normal OSQP problem.
+
+    Unitree's simulator bridge populates ``tau_est`` from MuJoCo's
+    ``jointactuatorfrc`` sensor, so it has the actuator-effort sign.  In a
+    quasi-static configuration the generalized joint equilibrium is
+
+    ``tau_est + tau_gravity_external + J.T @ force_ground_on_wheel = 0``.
+
+    Consequently the contact torque fitted below is
+    ``-(tau_est + tau_gravity_external)``.  This is equivalent to subtracting
+    the motor gravity-compensation and then converting motor load to the
+    ground-on-wheel convention.  A synthetic sign convention must not be used
+    here: doing so produces negative normal loads for the audited MJCF.
+    """
 
     q_array = _vector(q, 12, "q")
     tau_array = _vector(tau_est, 12, "tau_est")
+    rpy_array = _vector(body_rpy, 3, "body_rpy")
     if body_weight_n <= 0.0 or not math.isfinite(body_weight_n):
         raise ValueError("body_weight_n must be positive and finite")
     osqp, sparse = _load_qp_dependencies()
 
     jacobians = leg_jacobians(q_array)
-    positions = wheel_positions(q_array)
+    rotation = rpy_rotation(rpy_array)
+    positions = (rotation @ wheel_positions(q_array).T).T
     conditions = np.asarray([np.linalg.cond(jacobian) for jacobian in jacobians])
     max_condition = float(np.max(conditions))
-    gravity = gravity_torques(q_array)
-    tau_contact = tau_array - gravity
+    gravity = gravity_torques(q_array, rpy_array)
+    tau_contact = -(tau_array + gravity)
 
     torque_map = np.zeros((12, 12), dtype=float)
     for leg in range(4):
         torque_map[3 * leg : 3 * leg + 3, 3 * leg : 3 * leg + 3] = (
-            jacobians[leg].T
+            jacobians[leg].T @ rotation.T
         )
 
     equilibrium = np.zeros((6, 12), dtype=float)
     for leg in range(4):
         equilibrium[0:3, 3 * leg : 3 * leg + 3] = np.eye(3)
         equilibrium[3:6, 3 * leg : 3 * leg + 3] = skew(positions[leg])
-    desired_wrench = np.asarray([0.0, 0.0, body_weight_n, 0.0, 0.0, 0.0])
+    upward_force = np.asarray([0.0, 0.0, body_weight_n])
+    com_world = rotation @ whole_body_com(q_array)
+    # Contact forces balance both gravity force and its moment about the base
+    # origin.  A zero desired moment is only correct when the COM is exactly on
+    # that origin's vertical line, which is not true during a roll gesture.
+    desired_wrench = np.concatenate(
+        [upward_force, np.cross(com_world, upward_force)]
+    )
+
+    def invalid_contact(status: str, reason: str, solve_time_s: float = 0.0):
+        return ContactEstimate(
+            forces=np.full((4, 3), np.nan),
+            gravity_torque=gravity,
+            torque_contact=tau_contact,
+            status=status,
+            iterations=0,
+            solve_time_s=solve_time_s,
+            max_jacobian_condition=max_condition,
+            torque_residual_ratio=float("inf"),
+            force_balance_residual_n=float("inf"),
+            moment_balance_residual_nm=float("inf"),
+            balance_residual_ratio=float("inf"),
+            total_vertical_load_n=float("nan"),
+            minimum_normal_load_n=float("nan"),
+            valid=False,
+            reason=reason,
+        )
 
     equilibrium_weight = 0.02
     regularization = 1.0e-6
@@ -688,16 +782,34 @@ def estimate_contact_forces(
         warm_starting=True,
     )
     try:
-        solver.setup(**setup_kwargs)
-    except TypeError:
-        setup_kwargs.pop("warm_starting", None)
-        setup_kwargs["warm_start"] = True
-        setup_kwargs.pop("polishing", None)
-        setup_kwargs["polish"] = False
-        solver.setup(**setup_kwargs)
+        try:
+            solver.setup(**setup_kwargs)
+        except TypeError:
+            setup_kwargs.pop("warm_starting", None)
+            setup_kwargs["warm_start"] = True
+            setup_kwargs.pop("polishing", None)
+            setup_kwargs["polish"] = False
+            solver.setup(**setup_kwargs)
+    except Exception as error:
+        return invalid_contact(
+            "setup-exception",
+            "contact-force QP setup raised {}: {}".format(
+                type(error).__name__, error
+            ),
+        )
 
     started = time.perf_counter()
-    result = solver.solve()
+    try:
+        result = solver.solve()
+    except Exception as error:
+        elapsed = time.perf_counter() - started
+        return invalid_contact(
+            "solve-exception",
+            "contact-force QP solve raised {}: {}".format(
+                type(error).__name__, error
+            ),
+            elapsed,
+        )
     elapsed = time.perf_counter() - started
     info = result.info
     status = str(getattr(info, "status", "unknown")).lower()
@@ -733,7 +845,9 @@ def estimate_contact_forces(
     )
     wrench = equilibrium @ forces.reshape(-1)
     force_residual = float(np.linalg.norm(wrench[:3] - desired_wrench[:3]))
-    moment_residual = float(np.linalg.norm(wrench[3:]))
+    moment_residual = float(
+        np.linalg.norm(wrench[3:] - desired_wrench[3:])
+    )
     moment_scale = body_weight_n * 0.25
     balance_ratio = max(force_residual / body_weight_n, moment_residual / moment_scale)
     total_vertical = float(np.sum(forces[:, 2]))
@@ -867,10 +981,31 @@ class KinematicWBC:
         posture_target_q: Sequence[float],
         task_estimate: TaskSpaceEstimate,
         task_target: WBCTarget,
+        body_angular_velocity: Sequence[float] = (0.0, 0.0, 0.0),
     ) -> WBCSolveResult:
         q = _vector(measured_q, 12, "measured_q")
         q_ref = _vector(current_q_ref, 12, "current_q_ref")
         posture = _vector(posture_target_q, 12, "posture_target_q")
+        body_gyro = _vector(
+            body_angular_velocity, 3, "body_angular_velocity"
+        )
+
+        def invalid_result(status: str, reason: str, elapsed_s: float = 0.0):
+            return WBCSolveResult(
+                q_ref=q_ref.copy(),
+                generalized_velocity=np.zeros(18),
+                status=status,
+                iterations=0,
+                solve_time_s=elapsed_s,
+                primal_residual=float("inf"),
+                dual_residual=float("inf"),
+                contact_velocity_residual_m_s=float("inf"),
+                valid=False,
+                reason=reason,
+            )
+        # Account for matrix assembly and OSQP setup as part of the 100 Hz
+        # budget, rather than reporting only the final ADMM call.
+        started = time.perf_counter()
         osqp, sparse = _load_qp_dependencies()
 
         desired_velocity = np.zeros(18, dtype=float)
@@ -885,15 +1020,28 @@ class KinematicWBC:
             )
         )
         desired_velocity[3] = float(
-            np.clip(4.0 * (task_target.roll_rad - task_estimate.roll_rad), -0.8, 0.8)
+            np.clip(
+                4.0 * (task_target.roll_rad - task_estimate.roll_rad)
+                - 1.5 * body_gyro[0],
+                -0.8,
+                0.8,
+            )
         )
         desired_velocity[4] = float(
             np.clip(
-                4.0 * (task_target.pitch_rad - task_estimate.pitch_rad), -0.8, 0.8
+                4.0 * (task_target.pitch_rad - task_estimate.pitch_rad)
+                - 1.5 * body_gyro[1],
+                -0.8,
+                0.8,
             )
         )
         desired_velocity[5] = float(
-            np.clip(2.0 * (task_target.yaw_rad - task_estimate.yaw_rad), -0.5, 0.5)
+            np.clip(
+                2.0 * (task_target.yaw_rad - task_estimate.yaw_rad)
+                - 0.5 * body_gyro[2],
+                -0.5,
+                0.5,
+            )
         )
         desired_velocity[6:] = np.clip(4.0 * (posture - q), -1.0, 1.0)
 
@@ -964,18 +1112,47 @@ class KinematicWBC:
             warm_starting=True,
         )
         try:
-            solver.setup(**setup_kwargs)
-        except TypeError:
-            setup_kwargs.pop("warm_starting", None)
-            setup_kwargs["warm_start"] = True
-            setup_kwargs.pop("polishing", None)
-            setup_kwargs["polish"] = False
-            solver.setup(**setup_kwargs)
+            try:
+                solver.setup(**setup_kwargs)
+            except TypeError:
+                setup_kwargs.pop("warm_starting", None)
+                setup_kwargs["warm_start"] = True
+                setup_kwargs.pop("polishing", None)
+                setup_kwargs["polish"] = False
+                solver.setup(**setup_kwargs)
+        except Exception as error:
+            elapsed = time.perf_counter() - started
+            return invalid_result(
+                "setup-exception",
+                "kinematic WBC QP setup raised {}: {}".format(
+                    type(error).__name__, error
+                ),
+                elapsed,
+            )
         if self.previous_solution is not None:
-            solver.warm_start(x=self.previous_solution)
+            try:
+                solver.warm_start(x=self.previous_solution)
+            except Exception as error:
+                elapsed = time.perf_counter() - started
+                return invalid_result(
+                    "warm-start-exception",
+                    "kinematic WBC warm start raised {}: {}".format(
+                        type(error).__name__, error
+                    ),
+                    elapsed,
+                )
 
-        started = time.perf_counter()
-        result = solver.solve()
+        try:
+            result = solver.solve()
+        except Exception as error:
+            elapsed = time.perf_counter() - started
+            return invalid_result(
+                "solve-exception",
+                "kinematic WBC QP solve raised {}: {}".format(
+                    type(error).__name__, error
+                ),
+                elapsed,
+            )
         elapsed = time.perf_counter() - started
         info = result.info
         status = str(getattr(info, "status", "unknown")).lower()
@@ -1001,7 +1178,10 @@ class KinematicWBC:
                 reason = "kinematic WBC QP returned a non-finite solution"
             elif elapsed > WBC_MAX_SOLVE_S:
                 reason = "kinematic WBC solve exceeded 10 ms"
-            elif primal_residual > 10.0 * WBC_EPS_ABS or dual_residual > 10.0 * WBC_EPS_ABS:
+            elif (
+                primal_residual > WBC_MAX_PRIMAL_RESIDUAL
+                or dual_residual > WBC_MAX_DUAL_RESIDUAL
+            ):
                 reason = "kinematic WBC residual exceeded the configured bound"
             contact_vectors = (contact_matrix @ generalized_velocity).reshape(4, 3)
             contact_residual = float(

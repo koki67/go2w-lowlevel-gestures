@@ -63,6 +63,30 @@ class ControllerTests(unittest.TestCase):
             controller_module.HIGH,
         )
 
+    def test_original_controller_keeps_core_lowstate_when_extended_fields_are_absent(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "height"
+        )
+        message = mock.Mock(
+            motor_state=[
+                mock.Mock(q=0.01 * index, dq=-0.02 * index, spec=("q", "dq"))
+                for index in range(16)
+            ],
+            imu_state=mock.Mock(rpy=[0.1, -0.2, 0.3], spec=("rpy",)),
+            spec=("motor_state", "imu_state"),
+        )
+
+        controller.on_low_state(message)
+
+        sample = controller._latest_sample()
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample.pose[3], 0.03)
+        self.assertEqual(sample.wheel_velocity, [-0.24, -0.26, -0.28, -0.3])
+        self.assertEqual(sample.rpy, [0.1, -0.2, 0.3])
+        self.assertEqual(sample.tau_est, [])
+        self.assertEqual(sample.motor_mode, [])
+        self.assertEqual(sample.gyro, [])
+
     def test_dry_run_never_creates_publisher_or_changes_mode(self):
         controller = controller_module.HardwareGestureController(
             "eth0", "192.168.123.18", "height"
@@ -73,6 +97,7 @@ class ControllerTests(unittest.TestCase):
         controller._capture_stable_prone = mock.Mock(
             return_value=(list(PRONE), [0.0, 0.0, 0.0])
         )
+        controller._validate_preflight_state = mock.Mock()
 
         with mock.patch.object(
             controller_module, "interface_ipv4", return_value="192.168.123.18"
@@ -82,6 +107,7 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(controller._publisher)
         self.assertFalse(controller._mode_released)
         controller._initialize_dds.assert_called_once_with()
+        controller._validate_preflight_state.assert_called_once_with()
 
     def test_roll_dry_run_never_creates_publisher_or_changes_mode(self):
         controller = controller_module.HardwareGestureController(
@@ -547,6 +573,12 @@ class ControllerTests(unittest.TestCase):
             "192.168.123.18",
             gesture,
             timing=accelerated_timing,
+            # This millisecond-scale command-generation harness intentionally
+            # runs faster than its feeder thread can deterministically publish
+            # every intermediate sample.  Watchdog behavior is covered by
+            # dedicated tests; disabling it here removes scheduler flakiness
+            # without changing any production wrapper policy.
+            tracking_stop_rad=None,
         )
         publisher = FakePublisher()
         controller._publisher = publisher

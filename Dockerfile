@@ -76,6 +76,7 @@ COPY go2w_closed_loop_control.py /app/go2w_closed_loop_control.py
 COPY go2w_gesture_real_adaptive.py /app/go2w_gesture_real_adaptive.py
 COPY go2w_gesture_real_wbc.py /app/go2w_gesture_real_wbc.py
 COPY simulation /app/simulation
+COPY qualification /app/qualification
 COPY tests /app/tests
 
 RUN python -m unittest discover -s /app/tests -v \
@@ -88,7 +89,9 @@ RUN python -m unittest discover -s /app/tests -v \
     && python /app/simulation/go2w_height_sequence_sim.py --describe \
     && python /app/simulation/go2w_roll_sequence_sim.py --describe \
     && python /app/simulation/go2w_quick_stand_sequence_sim.py --describe \
-    && python /app/simulation/go2w_shake_off_sequence_sim.py --describe
+    && python /app/simulation/go2w_shake_off_sequence_sim.py --describe \
+    && python /app/simulation/go2w_closed_loop_sequence_sim.py --describe \
+    && python /app/qualification/go2w_qualify_live.py --help
 
 
 FROM ubuntu:22.04 AS runtime

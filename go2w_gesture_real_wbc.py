@@ -45,7 +45,10 @@ def print_wbc_plan(gesture=None, timing=base.FAST_TIMING):
         "left +0.395469 rad"
     )
     print("  pitch stays at the STANDARD reference; x/y/yaw are held")
-    print("  contact forces use tau_est - gravity and J(q)^T f; foot_force is unused")
+    print(
+        "  contact forces use actuator/gravity equilibrium and J(q)^T f; "
+        "foot_force is unused"
+    )
     print("  requires 0.5 s continuously valid four-wheel load estimation")
     print("  hardware requires: {}".format(SUPPORT_CONFIRMATION))
     print("  this is not a direct-torque dynamic WBC")
@@ -130,12 +133,24 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
         return extra
 
     def _estimate_contacts(self, sample):
-        contact = closed_loop.estimate_contact_forces(
-            sample.pose,
-            sample.tau_est[:12],
-        )
+        try:
+            contact = closed_loop.estimate_contact_forces(
+                sample.pose,
+                sample.tau_est[:12],
+                sample.rpy,
+            )
+        except Exception as error:
+            raise base.ControlledReturnRequested(
+                "contact estimator failed closed with {}: {}".format(
+                    type(error).__name__, error
+                )
+            ) from error
         self._latest_contact_estimate = contact
         return contact
+
+    def _validate_preflight_state(self):
+        super()._validate_preflight_state()
+        closed_loop._load_qp_dependencies()
 
     def _estimate_task(self, sample, contact):
         if self._baseline_height_m is None:
@@ -204,6 +219,12 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
         next_tick = start
         tick = 0
         latest_contact = None
+        hold_governor = closed_loop.ReferenceGovernor(
+            q_ref,
+            q_ref,
+            duration_s=1.0,
+            timeout_s=CONTACT_GATE_TIMEOUT_S + 1.0,
+        )
         while True:
             elapsed = time.monotonic() - start
             if elapsed > CONTACT_GATE_TIMEOUT_S:
@@ -224,25 +245,28 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
             )
             self._check_extended_runtime(sample)
             if tick % 5 == 0:
+                hold_decision = hold_governor.step(
+                    sample.pose,
+                    sample.leg_velocity,
+                    sample.tau_est[:12],
+                    closed_loop.WBC_PERIOD_S,
+                    elapsed,
+                )
+                if hold_decision.emergency:
+                    raise RuntimeError(
+                        hold_decision.reason or "contact-gate torque emergency"
+                    )
+                if hold_decision.request_return:
+                    raise base.ControlledReturnRequested(
+                        hold_decision.reason
+                        or "contact-gate governor requested controlled return"
+                    )
                 latest_contact = self._estimate_contacts(sample)
                 ready = gate.update(latest_contact.valid, closed_loop.WBC_PERIOD_S)
-                task_placeholder = SimpleNamespace(
-                    progress=min(1.0, gate.valid_s / gate.required_s),
-                    speed_scale=0.0,
-                    tracking_ratio=max(
-                        abs(q_ref[index] - sample.pose[index])
-                        / closed_loop.TRACKING_ENVELOPE_RAD[index]
-                        for index in range(12)
-                    ),
-                    torque_ratio=max(
-                        abs(sample.tau_est[index]) / closed_loop.TORQUE_LIMIT_NM[index]
-                        for index in range(12)
-                    ),
-                )
                 self._record_wbc_tick(
                     sample,
                     q_ref,
-                    task_placeholder,
+                    hold_decision,
                     "WBC contact validation",
                     elapsed,
                     event=latest_contact.reason or "contact-valid",
@@ -303,6 +327,12 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
         next_tick = start
         tick = 0
         latest_contact = self._latest_contact_estimate
+        hold_governor = closed_loop.ReferenceGovernor(
+            q_ref,
+            q_ref,
+            duration_s=1.0,
+            timeout_s=SUPPORT_CONFIRMATION_TIMEOUT_S + 1.0,
+        )
         while True:
             elapsed = time.monotonic() - start
             if elapsed > SUPPORT_CONFIRMATION_TIMEOUT_S:
@@ -316,6 +346,22 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
             )
             self._check_extended_runtime(sample)
             if tick % 5 == 0:
+                hold_decision = hold_governor.step(
+                    sample.pose,
+                    sample.leg_velocity,
+                    sample.tau_est[:12],
+                    closed_loop.WBC_PERIOD_S,
+                    elapsed,
+                )
+                if hold_decision.emergency:
+                    raise RuntimeError(
+                        hold_decision.reason or "support-hold torque emergency"
+                    )
+                if hold_decision.request_return:
+                    raise base.ControlledReturnRequested(
+                        hold_decision.reason
+                        or "support-hold governor requested controlled return"
+                    )
                 latest_contact = self._estimate_contacts(sample)
                 if not latest_contact.valid:
                     raise base.ControlledReturnRequested(
@@ -323,23 +369,10 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
                             latest_contact.reason
                         )
                     )
-                placeholder = SimpleNamespace(
-                    progress=0.0,
-                    speed_scale=0.0,
-                    tracking_ratio=max(
-                        abs(q_ref[index] - sample.pose[index])
-                        / closed_loop.TRACKING_ENVELOPE_RAD[index]
-                        for index in range(12)
-                    ),
-                    torque_ratio=max(
-                        abs(sample.tau_est[index]) / closed_loop.TORQUE_LIMIT_NM[index]
-                        for index in range(12)
-                    ),
-                )
                 self._record_wbc_tick(
                     sample,
                     q_ref,
-                    placeholder,
+                    hold_decision,
                     "WBC visual support confirmation",
                     elapsed,
                     extra=self._contact_extra(latest_contact),
@@ -454,13 +487,21 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
                         posture_target,
                         decision.progress,
                     )
-                    qp_result = self._wbc_solver.solve(
-                        sample.pose,
-                        q_ref,
-                        desired_posture,
-                        estimate,
-                        desired_task,
-                    )
+                    try:
+                        qp_result = self._wbc_solver.solve(
+                            sample.pose,
+                            q_ref,
+                            desired_posture,
+                            estimate,
+                            desired_task,
+                            sample.gyro,
+                        )
+                    except Exception as error:
+                        raise base.ControlledReturnRequested(
+                            "WBC solver failed closed with {}: {}".format(
+                                type(error).__name__, error
+                            )
+                        ) from error
                     if not qp_result.valid:
                         raise base.ControlledReturnRequested(
                             "WBC QP failed closed: {}".format(qp_result.reason)

@@ -697,38 +697,56 @@ class HardwareGestureController:
         try:
             motor_state = message.motor_state
             imu_state = message.imu_state
-            sample = StateSample(
-                received_at=now,
-                pose=[float(motor_state[index].q) for index in range(12)],
-                leg_velocity=[
-                    float(motor_state[index].dq) for index in range(12)
-                ],
-                wheel_velocity=[
-                    float(motor_state[index].dq) for index in range(12, 16)
-                ],
-                rpy=[float(imu_state.rpy[index]) for index in range(3)],
-                tau_est=[float(motor_state[index].tau_est) for index in range(16)],
-                motor_mode=[
-                    int(getattr(motor_state[index], "mode", 0)) for index in range(16)
-                ],
-                motor_lost=[
-                    int(getattr(motor_state[index], "lost", 0)) for index in range(16)
-                ],
-                temperature=[
-                    float(getattr(motor_state[index], "temperature", float("nan")))
-                    for index in range(16)
-                ],
-                gyro=[
-                    float(imu_state.gyroscope[index]) for index in range(3)
-                ],
-                acceleration=[
-                    float(imu_state.accelerometer[index]) for index in range(3)
-                ],
-                power_v=float(getattr(message, "power_v", float("nan"))),
-                power_a=float(getattr(message, "power_a", float("nan"))),
-            )
+            pose = [float(motor_state[index].q) for index in range(12)]
+            leg_velocity = [float(motor_state[index].dq) for index in range(12)]
+            wheel_velocity = [
+                float(motor_state[index].dq) for index in range(12, 16)
+            ]
+            rpy = [float(imu_state.rpy[index]) for index in range(3)]
         except (AttributeError, IndexError, TypeError, ValueError):
             return
+
+        # The original four wrappers only require q/dq/rpy.  Keep accepting
+        # those core fields even if an older or test SDK object lacks one of
+        # the extended fields.  Adaptive/WBC controllers separately require
+        # every extended vector before they can take LowCmd ownership.
+        def optional_motor_values(attribute, converter):
+            try:
+                return [
+                    converter(getattr(motor_state[index], attribute))
+                    for index in range(16)
+                ]
+            except (AttributeError, IndexError, TypeError, ValueError):
+                return []
+
+        def optional_imu_values(attribute):
+            try:
+                values = getattr(imu_state, attribute)
+                return [float(values[index]) for index in range(3)]
+            except (AttributeError, IndexError, TypeError, ValueError):
+                return []
+
+        def optional_float(attribute):
+            try:
+                return float(getattr(message, attribute))
+            except (AttributeError, TypeError, ValueError):
+                return float("nan")
+
+        sample = StateSample(
+            received_at=now,
+            pose=pose,
+            leg_velocity=leg_velocity,
+            wheel_velocity=wheel_velocity,
+            rpy=rpy,
+            tau_est=optional_motor_values("tau_est", float),
+            motor_mode=optional_motor_values("mode", int),
+            motor_lost=optional_motor_values("lost", int),
+            temperature=optional_motor_values("temperature", float),
+            gyro=optional_imu_values("gyroscope"),
+            acceleration=optional_imu_values("accelerometer"),
+            power_v=optional_float("power_v"),
+            power_a=optional_float("power_a"),
+        )
         with self._lock:
             self._samples.append(sample)
 
@@ -1309,6 +1327,11 @@ class HardwareGestureController:
         else:
             raise RuntimeError("unsupported gesture: {!r}".format(self.gesture))
 
+    def _validate_preflight_state(self):
+        """Subclass hook for read-only LowState contract validation."""
+
+        return None
+
     def _return_prone_after_interrupt(self):
         if self._publisher is None or self._captured_prone is None:
             return False
@@ -1471,6 +1494,7 @@ class HardwareGestureController:
         self._wait_for_first_state()
         mode_form, mode_name = self._check_mode()
         prone_pose, rpy = self._capture_stable_prone()
+        self._validate_preflight_state()
 
         print_sequence_plan(self.gesture, self.timing)
         print_tracking_policy(self.tracking_stop_rad)
