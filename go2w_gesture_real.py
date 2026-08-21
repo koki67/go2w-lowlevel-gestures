@@ -21,7 +21,7 @@ import argparse
 from array import array
 from collections import deque
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import fcntl
 import json
@@ -354,6 +354,14 @@ class StateSample:
     leg_velocity: List[float]
     wheel_velocity: List[float]
     rpy: List[float]
+    tau_est: List[float] = field(default_factory=list)
+    motor_mode: List[int] = field(default_factory=list)
+    motor_lost: List[int] = field(default_factory=list)
+    temperature: List[float] = field(default_factory=list)
+    gyro: List[float] = field(default_factory=list)
+    acceleration: List[float] = field(default_factory=list)
+    power_v: float = float("nan")
+    power_a: float = float("nan")
 
 
 class TrackingRecorder:
@@ -583,6 +591,10 @@ class HardStop(Exception):
     pass
 
 
+class ControlledReturnRequested(Exception):
+    """Request a fail-closed return to the captured prone pose."""
+
+
 class HardwareGestureController:
     def __init__(
         self,
@@ -683,16 +695,37 @@ class HardwareGestureController:
     def on_low_state(self, message):
         now = time.monotonic()
         try:
+            motor_state = message.motor_state
+            imu_state = message.imu_state
             sample = StateSample(
                 received_at=now,
-                pose=[float(message.motor_state[index].q) for index in range(12)],
+                pose=[float(motor_state[index].q) for index in range(12)],
                 leg_velocity=[
-                    float(message.motor_state[index].dq) for index in range(12)
+                    float(motor_state[index].dq) for index in range(12)
                 ],
                 wheel_velocity=[
-                    float(message.motor_state[index].dq) for index in range(12, 16)
+                    float(motor_state[index].dq) for index in range(12, 16)
                 ],
-                rpy=[float(message.imu_state.rpy[index]) for index in range(3)],
+                rpy=[float(imu_state.rpy[index]) for index in range(3)],
+                tau_est=[float(motor_state[index].tau_est) for index in range(16)],
+                motor_mode=[
+                    int(getattr(motor_state[index], "mode", 0)) for index in range(16)
+                ],
+                motor_lost=[
+                    int(getattr(motor_state[index], "lost", 0)) for index in range(16)
+                ],
+                temperature=[
+                    float(getattr(motor_state[index], "temperature", float("nan")))
+                    for index in range(16)
+                ],
+                gyro=[
+                    float(imu_state.gyroscope[index]) for index in range(3)
+                ],
+                acceleration=[
+                    float(imu_state.accelerometer[index]) for index in range(3)
+                ],
+                power_v=float(getattr(message, "power_v", float("nan"))),
+                power_a=float(getattr(message, "power_a", float("nan"))),
             )
         except (AttributeError, IndexError, TypeError, ValueError):
             return
@@ -1493,12 +1526,23 @@ class HardwareGestureController:
         self._run_outcome = "running"
 
         publisher_close_error = None
+        deferred_controlled_return_error = None
         try:
             self._run_selected_gesture()
         except InterruptedSequence:
             self._run_outcome = "interrupted-controlled-return"
             self._return_prone_after_interrupt()
             self._neutralize(NEUTRAL_COMMAND_S)
+        except ControlledReturnRequested as error:
+            self._run_outcome = "watchdog-controlled-return"
+            returned_prone = self._return_prone_after_interrupt()
+            self._neutralize(NEUTRAL_COMMAND_S if returned_prone else 0.25)
+            deferred_controlled_return_error = RuntimeError(
+                "controlled return requested: {}; captured-prone return {}".format(
+                    error,
+                    "completed" if returned_prone else "failed",
+                )
+            )
         except HardStop:
             self._run_outcome = "hard-stop"
             self._neutralize(0.25)
@@ -1558,6 +1602,8 @@ class HardwareGestureController:
             )
         if self._run_outcome == "running":
             self._run_outcome = "completed"
+        if deferred_controlled_return_error is not None:
+            raise deferred_controlled_return_error
 
 
 def parse_args(argv):
@@ -1608,6 +1654,9 @@ def main(
     argv=None,
     timing=SLOW_TIMING,
     tracking_stop_rad=RUN_MAX_TRACKING_ERROR_RAD,
+    controller_class=None,
+    sequence_printer=print_sequence_plan,
+    controller_kwargs=None,
 ):
     if not isinstance(timing, GestureTimingProfile):
         raise ValueError("invalid timing profile: {!r}".format(timing))
@@ -1617,9 +1666,13 @@ def main(
         raise ValueError(
             "tracking stop threshold must be a positive finite value or None"
         )
+    if controller_class is None:
+        # Resolve at call time so existing wrappers and tests that replace the
+        # public controller class retain their historical behavior.
+        controller_class = HardwareGestureController
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.describe:
-        print_sequence_plan(args.gesture, timing)
+        sequence_printer(args.gesture, timing)
         print_tracking_policy(tracking_stop_rad)
         return 0
     if args.gesture is None:
@@ -1636,13 +1689,15 @@ def main(
     error_text = None
     try:
         load_unitree_sdk()
-        controller = HardwareGestureController(
+        extra_controller_kwargs = dict(controller_kwargs or {})
+        controller = controller_class(
             args.interface,
             args.expected_ip,
             args.gesture,
             timing=timing,
             tracking_log_dir=args.tracking_log_dir,
             tracking_stop_rad=tracking_stop_rad,
+            **extra_controller_kwargs
         )
         signal.signal(signal.SIGINT, controller.request_stop)
         signal.signal(signal.SIGTERM, controller.request_stop)
