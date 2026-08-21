@@ -138,15 +138,37 @@ repository:
 ```bash
 make sim-height
 make sim-roll
-make sim-low-to-high
+make sim-quick-stand
+make sim-shake-off
+```
+
+`sim-quick-stand` follows the standard and low setup poses, then interpolates
+from low to high in `0.1 s`. It is a simulation-only sequence.
+
+`sim-shake-off` reuses the same 70%-of-limit roll targets as `sim-roll`, but
+runs 8 right/left cycles with a `0.10 s` transition and `0.03 s` hold at each
+side. It is an intentionally aggressive, simulation-only starting point for a
+wet-dog-style shake and is not qualified for hardware.
+
+These default commands do not record or save a joint-tracking graph. To record
+the target and actual joint-angle history and save it as an SVG, add the common
+`save-plot` goal to any simulation run:
+
+```bash
+make sim-height save-plot
+make sim-roll save-plot
+make sim-quick-stand save-plot
+make sim-shake-off save-plot
 ```
 
 Each command fixes DDS to domain `0` on loopback (`lo`), refuses to start if a
 simulator or LowCmd publisher is already active there, starts and owns the
 MuJoCo child process, and stops it on `Ctrl+C`. The repository-owned flat scene
 is assembled in a temporary directory with links to the external Go2W model;
-the external checkout is not modified at runtime. Joint-tracking SVGs are
-written under `runs/mujoco/` and remain ignored generated output.
+the external checkout is not modified at runtime. With `--save-plot`, the SVG
+is written under `runs/mujoco/` after 3 seconds of the final hold. These SVGs
+are ignored generated output. Without the flag, tracking samples are not kept
+in memory and no graph is written.
 
 The external checkout's `simulate/config.yaml` and
 `simulate_python/config.py` do not need to be changed: robot, scene, DDS domain,

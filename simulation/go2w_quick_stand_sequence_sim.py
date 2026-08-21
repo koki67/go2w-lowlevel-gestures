@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a single Go2W low-to-high joint-pose sequence in MuJoCo.
+"""Run a single Go2W quick-stand joint-pose sequence in MuJoCo.
 
 This script is simulation-only. It starts and owns the flat Go2W MuJoCo
 process, commands the same STANDARD, LOW, and HIGH joint angles as
@@ -19,30 +19,34 @@ import go2w_height_sequence_sim as base  # noqa: E402
 
 LOW_TRANSITION_S = 2.0
 LOW_HOLD_S = 2.0
-HIGH_TRANSITION_S = 0.5
+QUICK_STAND_TRANSITION_S = 0.1
 
 
 def format_pose(pose: list[float]) -> str:
     return "[" + ", ".join(f"{angle:.2f}" for angle in pose) + "] rad"
 
 
-def print_plan() -> None:
+def print_plan(save_plot: bool = False) -> None:
     print("joint order: FR, FL, RR, RL; each leg is hip, thigh, calf")
     print(f"STANDARD = {format_pose(base.STANDARD)}")
     print(f"LOW      = {format_pose(base.LOW)}")
     print(f"HIGH     = {format_pose(base.HIGH)}")
-    print("Go2W simulated low-to-high sequence:")
+    print("Go2W simulated quick-stand sequence:")
     print(f"  startup -> standard: {base.STANDARD_TRANSITION_S:.1f} s")
     print(f"  hold standard: {base.STANDARD_HOLD_S:.1f} s")
     print(f"  standard -> low: {LOW_TRANSITION_S:.1f} s")
     print(f"  hold low: {LOW_HOLD_S:.1f} s")
-    print(f"  low -> high: {HIGH_TRANSITION_S:.1f} s")
+    print(f"  low -> high: {QUICK_STAND_TRANSITION_S:.1f} s")
     print("  hold high at 500 Hz until Ctrl+C")
+    print(
+        "  joint tracking plot: "
+        + ("save after final hold" if save_plot else "disabled (use --save-plot)")
+    )
 
 
-class LowToHighSequenceController(base.SequenceController):
-    def __init__(self) -> None:
-        super().__init__("go2w_low_to_high_sequence_sim")
+class QuickStandSequenceController(base.SequenceController):
+    def __init__(self, *, save_plot: bool = False) -> None:
+        super().__init__("go2w_quick_stand_sequence_sim", save_plot=save_plot)
 
     def run(self) -> None:
         flat_scene = self._prepare_flat_scene()
@@ -122,18 +126,26 @@ class LowToHighSequenceController(base.SequenceController):
                 "high",
                 current_pose,
                 base.HIGH,
-                HIGH_TRANSITION_S,
+                QUICK_STAND_TRANSITION_S,
             )
             final_hold_start = time.monotonic()
 
             with self._lock:
                 base_height = self._base_height
             height_text = "unknown" if base_height is None else f"{base_height:.3f} m"
+            if self._save_plot:
+                plot_status = (
+                    f"The joint plot will be written after "
+                    f"{base.FINAL_HOLD_PLOT_S:.1f} s of final hold; press Ctrl+C "
+                    "after that to close MuJoCo."
+                )
+            else:
+                plot_status = (
+                    "Joint plot recording is disabled; press Ctrl+C to close MuJoCo."
+                )
             print(
                 "sequence complete; holding high pose at 500 Hz "
-                f"(base_z={height_text}). The joint plot is written after "
-                f"{base.FINAL_HOLD_PLOT_S:.1f} s of final hold; press Ctrl+C "
-                "after that to close MuJoCo.",
+                f"(base_z={height_text}). {plot_status}",
                 flush=True,
             )
             self._run_final_hold(publisher, base.HIGH, final_hold_start)
@@ -151,13 +163,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="print joint targets and sequence without starting DDS or MuJoCo",
     )
+    parser.add_argument(
+        "--save-plot",
+        action="store_true",
+        help="record target/actual joint angles and save an SVG after final hold",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     if args.describe:
-        print_plan()
+        print_plan(args.save_plot)
         return 0
 
     try:
@@ -167,8 +184,8 @@ def main() -> int:
         print(f"error: {error}", file=sys.stderr, flush=True)
         return 1
 
-    print_plan()
-    controller = LowToHighSequenceController()
+    print_plan(args.save_plot)
+    controller = QuickStandSequenceController(save_plot=args.save_plot)
     signal.signal(signal.SIGINT, controller.request_stop)
     signal.signal(signal.SIGTERM, controller.request_stop)
     try:

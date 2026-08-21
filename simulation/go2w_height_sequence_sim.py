@@ -196,7 +196,12 @@ def doctor() -> bool:
 
 
 class SequenceController:
-    def __init__(self, plot_stem: str = "go2w_height_sequence_sim") -> None:
+    def __init__(
+        self,
+        plot_stem: str = "go2w_height_sequence_sim",
+        *,
+        save_plot: bool = False,
+    ) -> None:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._low_state: LowState_ | None = None
@@ -207,6 +212,7 @@ class SequenceController:
         self._simulator: subprocess.Popen[bytes] | None = None
         self._scene_workspace: tempfile.TemporaryDirectory[str] | None = None
         self._plot_stem = plot_stem
+        self._save_plot = save_plot
         self._tracking_start_time: float | None = None
         self._tracking_times: list[float] = []
         self._tracking_targets: list[list[float]] = []
@@ -299,7 +305,7 @@ class SequenceController:
         self._record_tracking_sample(pose)
 
     def _record_tracking_sample(self, target: list[float]) -> None:
-        if self._tracking_complete:
+        if not self._save_plot or self._tracking_complete:
             return
         timestamp = time.monotonic()
         with self._lock:
@@ -525,7 +531,7 @@ class SequenceController:
             self._check_runtime()
             self._publish(publisher, pose)
             now = time.monotonic()
-            if not self._tracking_complete and now >= plot_end:
+            if self._save_plot and not self._tracking_complete and now >= plot_end:
                 self._write_tracking_plot(final_hold_start, plot_end)
 
             next_tick += CONTROL_PERIOD_S
@@ -706,11 +712,18 @@ class SequenceController:
             with self._lock:
                 base_height = self._base_height
             height_text = "unknown" if base_height is None else f"{base_height:.3f} m"
+            if self._save_plot:
+                plot_status = (
+                    f"The joint plot will be written after {FINAL_HOLD_PLOT_S:.1f} s "
+                    "of final hold; press Ctrl+C after that to close MuJoCo."
+                )
+            else:
+                plot_status = (
+                    "Joint plot recording is disabled; press Ctrl+C to close MuJoCo."
+                )
             print(
                 "sequence complete; holding standard pose at 500 Hz "
-                f"(base_z={height_text}). The joint plot is written after "
-                f"{FINAL_HOLD_PLOT_S:.1f} s of final hold; press Ctrl+C after "
-                "that to close MuJoCo.",
+                f"(base_z={height_text}). {plot_status}",
                 flush=True,
             )
             self._run_final_hold(publisher, STANDARD, final_hold_start)
@@ -721,7 +734,7 @@ class SequenceController:
             self._stop_simulator()
 
 
-def print_plan() -> None:
+def print_plan(save_plot: bool = False) -> None:
     print("joint order: FR, FL, RR, RL; each leg is hip, thigh, calf")
     print(f"STANDARD = {STANDARD}")
     print(f"LOW      = {LOW}")
@@ -736,6 +749,10 @@ def print_plan() -> None:
     )
     print(f"  high -> standard: {STANDARD_TRANSITION_S:.1f} s")
     print("  hold standard at 500 Hz until Ctrl+C")
+    print(
+        "  joint tracking plot: "
+        + ("save after final hold" if save_plot else "disabled (use --save-plot)")
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -750,6 +767,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="check the external unitree_mujoco runtime without launching it",
     )
+    parser.add_argument(
+        "--save-plot",
+        action="store_true",
+        help="record target/actual joint angles and save an SVG after final hold",
+    )
     return parser.parse_args()
 
 
@@ -758,7 +780,7 @@ def main() -> int:
     if args.doctor:
         return 0 if doctor() else 1
     if args.describe:
-        print_plan()
+        print_plan(args.save_plot)
         return 0
 
     try:
@@ -768,8 +790,8 @@ def main() -> int:
         print(f"error: {error}", file=sys.stderr, flush=True)
         return 1
 
-    print_plan()
-    controller = SequenceController()
+    print_plan(args.save_plot)
+    controller = SequenceController(save_plot=args.save_plot)
     signal.signal(signal.SIGINT, controller.request_stop)
     signal.signal(signal.SIGTERM, controller.request_stop)
     try:

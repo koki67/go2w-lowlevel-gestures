@@ -80,7 +80,8 @@ RUN python -m unittest discover -s /app/tests -v \
     && python /app/go2w_gesture_real_fast_no_tracking_stop.py --describe \
     && python /app/simulation/go2w_height_sequence_sim.py --describe \
     && python /app/simulation/go2w_roll_sequence_sim.py --describe \
-    && python /app/simulation/go2w_low_to_high_sequence_sim.py --describe
+    && python /app/simulation/go2w_quick_stand_sequence_sim.py --describe \
+    && python /app/simulation/go2w_shake_off_sequence_sim.py --describe
 
 
 FROM ubuntu:22.04 AS runtime

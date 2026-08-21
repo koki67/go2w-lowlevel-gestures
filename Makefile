@@ -11,6 +11,11 @@ UNITREE_MUJOCO_PYTHON ?= $(UNITREE_MUJOCO_ROOT)/simulate_python/.venv/bin/python
 SIM_ENV := UNITREE_MUJOCO_ROOT='$(UNITREE_MUJOCO_ROOT)' \
 	UNITREE_MUJOCO_PYTHON='$(UNITREE_MUJOCO_PYTHON)'
 SIM_DIR := simulation
+SIM_ARGS ?=
+SIM_RUN_ARGS := $(SIM_ARGS)
+ifneq ($(filter save-plot,$(MAKECMDGOALS)),)
+SIM_RUN_ARGS += --save-plot
+endif
 
 .PHONY: help build test clean describe \
 	describe-slow describe-slow-height describe-slow-roll \
@@ -29,7 +34,8 @@ SIM_DIR := simulation
 	live-fast-no-tracking-stop-height live-fast-no-tracking-stop-roll \
 	live-height live-roll \
 	sim-doctor sim-describe sim-describe-height sim-describe-roll \
-	sim-describe-low-to-high sim-height sim-roll sim-low-to-high
+	sim-describe-quick-stand sim-describe-shake-off \
+	sim-height sim-roll sim-quick-stand sim-shake-off save-plot
 
 help:
 	@echo "Non-hardware: make build | test | describe"
@@ -43,7 +49,10 @@ help:
 	@echo "Fast 1.0/0.5, no tracking-error stop: make live-fast-no-tracking-stop-height | live-fast-no-tracking-stop-roll"
 	@echo "Compatibility: preflight-height/roll and live-height/roll use slow"
 	@echo "MuJoCo requirement check: make sim-doctor"
-	@echo "MuJoCo runs (external unitree_mujoco): make sim-height | sim-roll | sim-low-to-high"
+	@echo "MuJoCo runs: make sim-height | sim-roll | sim-quick-stand | sim-shake-off"
+	@echo "Quick stand: low -> high in 0.1 s (simulation only)"
+	@echo "Shake off: 8 rapid right/left cycles (simulation only)"
+	@echo "Save a MuJoCo joint plot: make sim-height save-plot"
 
 build:
 	$(COMPOSE) build --pull
@@ -110,7 +119,8 @@ test:
 sim-doctor:
 	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_height_sequence_sim.py --doctor
 
-sim-describe: sim-describe-height sim-describe-roll sim-describe-low-to-high
+sim-describe: sim-describe-height sim-describe-roll sim-describe-quick-stand \
+	sim-describe-shake-off
 
 sim-describe-height:
 	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_height_sequence_sim.py --describe
@@ -118,17 +128,26 @@ sim-describe-height:
 sim-describe-roll:
 	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_roll_sequence_sim.py --describe
 
-sim-describe-low-to-high:
-	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_low_to_high_sequence_sim.py --describe
+sim-describe-quick-stand:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_quick_stand_sequence_sim.py --describe
+
+sim-describe-shake-off:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_shake_off_sequence_sim.py --describe
 
 sim-height:
-	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_height_sequence_sim.py
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_height_sequence_sim.py $(SIM_RUN_ARGS)
 
 sim-roll:
-	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_roll_sequence_sim.py
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_roll_sequence_sim.py $(SIM_RUN_ARGS)
 
-sim-low-to-high:
-	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_low_to_high_sequence_sim.py
+sim-quick-stand:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_quick_stand_sequence_sim.py $(SIM_RUN_ARGS)
+
+sim-shake-off:
+	$(SIM_ENV) $(HOST_PYTHON) $(SIM_DIR)/go2w_shake_off_sequence_sim.py $(SIM_RUN_ARGS)
+
+save-plot:
+	@:
 
 preflight-slow-height:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \

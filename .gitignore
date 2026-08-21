@@ -2,5 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+
+# Generated outputs, including opt-in MuJoCo joint-tracking SVGs.
 runs/*
 !runs/.gitkeep

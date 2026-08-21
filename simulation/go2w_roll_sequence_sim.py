@@ -159,28 +159,68 @@ def quaternion_to_rpy(quaternion: list[float]) -> tuple[float, float, float]:
     return roll, pitch, yaw
 
 
-def print_plan(lower: float, upper: float, source: str, amplitude: float) -> None:
+def print_plan(
+    lower: float,
+    upper: float,
+    source: str,
+    amplitude: float,
+    save_plot: bool = False,
+    *,
+    sequence_name: str = "roll",
+    transition_s: float = ROLL_TRANSITION_S,
+    hold_s: float = ROLL_HOLD_S,
+    cycles: int = ROLL_CYCLES,
+    final_standard_transition_s: float = FINAL_STANDARD_TRANSITION_S,
+) -> None:
     print(f"hip limits: [{lower:.4f}, {upper:.4f}] rad, source={source}")
     print(
         "applied common hip offset: "
         f"±{amplitude:.5f} rad (±{math.degrees(amplitude):.2f} deg), "
         f"{ROLL_LIMIT_SCALE:.0%} of the URDF-derived limit"
     )
-    print("Go2W simulated roll sequence:")
+    print(f"Go2W simulated {sequence_name} sequence:")
     print(f"  startup -> standard: {base.STANDARD_TRANSITION_S:.1f} s")
     print(f"  hold standard: {base.STANDARD_HOLD_S:.1f} s")
-    print(f"  repeat {ROLL_CYCLES} times:")
-    print(f"    -> right: {ROLL_TRANSITION_S:g} s, hold {ROLL_HOLD_S:.1f} s")
-    print(f"    -> left: {ROLL_TRANSITION_S:g} s, hold {ROLL_HOLD_S:.1f} s")
-    print(f"  left -> standard: {FINAL_STANDARD_TRANSITION_S:.1f} s")
+    print(f"  repeat {cycles} times:")
+    print(f"    -> right: {transition_s:g} s, hold {hold_s:g} s")
+    print(f"    -> left: {transition_s:g} s, hold {hold_s:g} s")
+    print(f"  left -> standard: {final_standard_transition_s:.1f} s")
     print("  hold standard at 500 Hz until Ctrl+C")
+    print(
+        "  joint tracking plot: "
+        + ("save after final hold" if save_plot else "disabled (use --save-plot)")
+    )
 
 
 class RollSequenceController(base.SequenceController):
-    def __init__(self, right: list[float], left: list[float]) -> None:
-        super().__init__("go2w_roll_sequence_sim")
+    def __init__(
+        self,
+        right: list[float],
+        left: list[float],
+        *,
+        plot_stem: str = "go2w_roll_sequence_sim",
+        transition_s: float = ROLL_TRANSITION_S,
+        hold_s: float = ROLL_HOLD_S,
+        cycles: int = ROLL_CYCLES,
+        cycle_label: str = "roll",
+        final_standard_transition_s: float = FINAL_STANDARD_TRANSITION_S,
+        save_plot: bool = False,
+    ) -> None:
+        if transition_s <= 0.0 or hold_s <= 0.0:
+            raise ValueError("roll transition and hold durations must be positive")
+        if cycles <= 0:
+            raise ValueError("roll cycles must be positive")
+        if final_standard_transition_s <= 0.0:
+            raise ValueError("final standard transition duration must be positive")
+
+        super().__init__(plot_stem, save_plot=save_plot)
         self._right = right
         self._left = left
+        self._transition_s = transition_s
+        self._hold_s = hold_s
+        self._cycles = cycles
+        self._cycle_label = cycle_label
+        self._final_standard_transition_s = final_standard_transition_s
         self._rpy: tuple[float, float, float] | None = None
         self._peak_abs_roll = 0.0
 
@@ -226,6 +266,21 @@ class RollSequenceController(base.SequenceController):
             duration_s,
             lambda alpha: self._interpolate(source, target, alpha),
         )
+
+    def _hold(
+        self,
+        publisher: base.ChannelPublisher,
+        name: str,
+        pose: list[float],
+        duration_s: float,
+    ) -> None:
+        # Keep very short shake-off holds visible instead of rounding 0.03 s
+        # down to 0.0 s in the runtime log.
+        with self._lock:
+            base_height = self._base_height
+        height_text = "unknown" if base_height is None else f"{base_height:.3f} m"
+        print(f"hold {name} ({duration_s:g} s), base_z={height_text}", flush=True)
+        self._run_for(publisher, duration_s, lambda _alpha: pose)
 
     def run(self) -> None:
         flat_scene = self._prepare_flat_scene()
@@ -285,16 +340,23 @@ class RollSequenceController(base.SequenceController):
             self._hold(publisher, "standard", base.STANDARD, base.STANDARD_HOLD_S)
             self._report_orientation("standard hold complete")
 
-            for cycle in range(1, ROLL_CYCLES + 1):
-                print(f"roll cycle {cycle}/{ROLL_CYCLES}", flush=True)
+            for cycle in range(1, self._cycles + 1):
+                print(
+                    f"{self._cycle_label} cycle {cycle}/{self._cycles}", flush=True
+                )
                 current_pose = self._transition(
                     publisher,
                     "right roll limit",
                     current_pose,
                     self._right,
-                    ROLL_TRANSITION_S,
+                    self._transition_s,
                 )
-                self._hold(publisher, "right roll limit", self._right, ROLL_HOLD_S)
+                self._hold(
+                    publisher,
+                    "right roll limit",
+                    self._right,
+                    self._hold_s,
+                )
                 self._report_orientation(f"cycle {cycle} right hold complete")
 
                 current_pose = self._transition(
@@ -302,9 +364,14 @@ class RollSequenceController(base.SequenceController):
                     "left roll limit",
                     current_pose,
                     self._left,
-                    ROLL_TRANSITION_S,
+                    self._transition_s,
                 )
-                self._hold(publisher, "left roll limit", self._left, ROLL_HOLD_S)
+                self._hold(
+                    publisher,
+                    "left roll limit",
+                    self._left,
+                    self._hold_s,
+                )
                 self._report_orientation(f"cycle {cycle} left hold complete")
 
             self._transition(
@@ -312,18 +379,27 @@ class RollSequenceController(base.SequenceController):
                 "standard",
                 current_pose,
                 base.STANDARD,
-                FINAL_STANDARD_TRANSITION_S,
+                self._final_standard_transition_s,
             )
             final_hold_start = time.monotonic()
             self._report_orientation("returned to standard")
 
             with self._lock:
                 peak_roll = self._peak_abs_roll
+            if self._save_plot:
+                plot_status = (
+                    f"The joint plot will be written after "
+                    f"{base.FINAL_HOLD_PLOT_S:.1f} s of final hold; press Ctrl+C "
+                    "after that to close MuJoCo."
+                )
+            else:
+                plot_status = (
+                    "Joint plot recording is disabled; press Ctrl+C to close MuJoCo."
+                )
             print(
                 "sequence complete; holding standard pose at 500 Hz. "
                 f"Peak measured |roll|={math.degrees(peak_roll):.2f} deg. "
-                f"The joint plot is written after {base.FINAL_HOLD_PLOT_S:.1f} s "
-                "of final hold; press Ctrl+C after that to close MuJoCo.",
+                f"{plot_status}",
                 flush=True,
             )
             self._run_final_hold(publisher, base.STANDARD, final_hold_start)
@@ -341,6 +417,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="print limits and sequence without starting DDS or MuJoCo",
     )
+    parser.add_argument(
+        "--save-plot",
+        action="store_true",
+        help="record target/actual joint angles and save an SVG after final hold",
+    )
     return parser.parse_args()
 
 
@@ -351,7 +432,7 @@ def main() -> int:
         upper = base.hardware_gesture.HIP_LIMIT_UPPER_RAD
         source = "hardware gesture constants; runtime cross-checks MuJoCo MJCF"
         amplitude, _right, _left = make_roll_targets(lower, upper)
-        print_plan(lower, upper, source, amplitude)
+        print_plan(lower, upper, source, amplitude, args.save_plot)
         return 0
 
     try:
@@ -363,8 +444,8 @@ def main() -> int:
         return 1
 
     amplitude, right, left = make_roll_targets(lower, upper)
-    print_plan(lower, upper, source, amplitude)
-    controller = RollSequenceController(right, left)
+    print_plan(lower, upper, source, amplitude, args.save_plot)
+    controller = RollSequenceController(right, left, save_plot=args.save_plot)
     signal.signal(signal.SIGINT, controller.request_stop)
     signal.signal(signal.SIGTERM, controller.request_stop)
     try:
