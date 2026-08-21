@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Headless MuJoCo qualification for adaptive and quasi-static Go2W control.
+"""MuJoCo qualification and GUI inspection for closed-loop Go2W control.
 
 The controller consumes only hardware-equivalent joint, actuator-torque, and
 IMU state.  MuJoCo ground-truth base pose and contacts are recorded strictly as
-evaluation evidence and are never passed into the control kernel.
+evaluation evidence and are never passed into the control kernel.  Qualification
+is headless by default; ``--viewer`` attaches MuJoCo's passive GUI to the same
+model, data, and controller execution path for one selected initial condition.
 """
 
 from __future__ import annotations
@@ -59,12 +61,17 @@ BELLY_LOADED_PRONE = [0.0, 1.52, -2.71] * 4
 
 np = None
 mujoco = None
+mujoco_viewer = None
 control = None
 hardware = None
 
 
 class SimulationFailure(RuntimeError):
     pass
+
+
+class ViewerClosed(SimulationFailure):
+    """Raised when the operator closes the passive viewer during a case."""
 
 
 def reexec_with_simulator_python() -> None:
@@ -75,13 +82,17 @@ def reexec_with_simulator_python() -> None:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
-def load_runtime() -> None:
-    global np, mujoco, control, hardware
+def load_runtime(enable_viewer=False) -> None:
+    global np, mujoco, mujoco_viewer, control, hardware
     if str(WORKSPACE_ROOT) not in sys.path:
         sys.path.insert(0, str(WORKSPACE_ROOT))
     try:
         import numpy as _np
         import mujoco as _mujoco
+        if enable_viewer:
+            import mujoco.viewer as _mujoco_viewer
+        else:
+            _mujoco_viewer = None
         import osqp  # noqa: F401
         import scipy  # noqa: F401
         import go2w_closed_loop_control as _control
@@ -94,6 +105,7 @@ def load_runtime() -> None:
         ) from error
     np = _np
     mujoco = _mujoco
+    mujoco_viewer = _mujoco_viewer
     control = _control
     hardware = _hardware
 
@@ -111,6 +123,7 @@ def describe(controller_name=None, gesture=None, initial="all") -> None:
     print("  WBC QP / position-PD publication: 100 Hz / 500 Hz")
     print("  external MJCF/source are read-only; a temporary scene is used")
     print("  ground truth is evaluation-only, never a controller input")
+    print("  --viewer: same controller path in a real-time MuJoCo GUI, one initial condition")
     print("  output is simulation qualification, not physical qualification")
 
 
@@ -148,7 +161,7 @@ def quaternion_to_rpy(quaternion):
 
 
 class HeadlessHarness:
-    def __init__(self, initial_condition):
+    def __init__(self, initial_condition, viewer_enabled=False, viewer_speed=1.0):
         self.initial_condition = initial_condition
         self._scene_workspace = tempfile.TemporaryDirectory(
             prefix="go2w-closed-loop-mujoco-"
@@ -165,6 +178,12 @@ class HeadlessHarness:
         self.base_body_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_BODY, "base_link"
         )
+        self.viewer = None
+        self.viewer_speed = float(viewer_speed)
+        self._viewer_wall_start = None
+        self._viewer_sim_start = None
+        if viewer_enabled:
+            self._start_viewer()
         self.q_ref = None
         self.phase = "initialization"
         self.max_tracking_ratio = 0.0
@@ -185,13 +204,81 @@ class HeadlessHarness:
         self.controlled_return_error = None
 
     def close(self):
+        viewer = self.viewer
+        self.viewer = None
+        if viewer is not None:
+            try:
+                viewer.close()
+            except RuntimeError:
+                pass
         self._scene_workspace.cleanup()
+
+    def _start_viewer(self):
+        if mujoco_viewer is None:
+            raise RuntimeError("MuJoCo viewer runtime was not loaded")
+        try:
+            mujoco.mj_forward(self.model, self.data)
+            self.viewer = mujoco_viewer.launch_passive(
+                self.model,
+                self.data,
+                show_left_ui=True,
+                show_right_ui=True,
+            )
+            self.viewer.cam.lookat[:] = self.data.xpos[self.base_body_id]
+            self.viewer.cam.distance = 1.5
+            self.viewer.cam.azimuth = 135.0
+            self.viewer.cam.elevation = -20.0
+            self._viewer_wall_start = time.monotonic()
+            self._viewer_sim_start = float(self.data.time)
+            self._sync_viewer(pace=False)
+        except Exception:
+            if self.viewer is not None:
+                try:
+                    self.viewer.close()
+                except RuntimeError:
+                    pass
+                self.viewer = None
+            self._scene_workspace.cleanup()
+            raise
+
+    def _sync_viewer(self, pace=True):
+        if self.viewer is None:
+            return
+        if not self.viewer.is_running():
+            raise ViewerClosed("MuJoCo viewer window was closed")
+        self.viewer.sync()
+        if not pace:
+            return
+        simulated_elapsed = float(self.data.time) - self._viewer_sim_start
+        deadline = self._viewer_wall_start + simulated_elapsed / self.viewer_speed
+        remaining = deadline - time.monotonic()
+        if remaining > 0.0:
+            time.sleep(remaining)
+
+    def hold_viewer_until_closed(self):
+        if self.viewer is None or not self.viewer.is_running():
+            return
+        print(
+            "[viewer] case finished; close the MuJoCo window to write the summary",
+            flush=True,
+        )
+        try:
+            while self.viewer.is_running():
+                self.viewer.sync()
+                time.sleep(1.0 / 60.0)
+        except KeyboardInterrupt:
+            print("[viewer] interrupted; closing the MuJoCo window", flush=True)
+
+    def set_phase(self, phase):
+        self.phase = phase
+        if self.viewer is not None:
+            print("[viewer] phase: {}".format(phase), flush=True)
 
     def reset_evaluation_metrics(self):
         """Start qualification metrics after controller-independent setup."""
 
         self.q_ref = None
-        self.phase = "captured-prone"
+        self.set_phase("captured-prone")
         self.max_tracking_ratio = 0.0
         self.max_tau_ratio = 0.0
         self.max_abs_tracking_error_rad = 0.0
@@ -319,6 +406,7 @@ class HeadlessHarness:
             self.data.ctrl[:] = control_values
             self.q_ref = q_ref_array.copy()
         mujoco.mj_step(self.model, self.data)
+        self._sync_viewer()
         if q_ref is not None:
             self._update_metrics(q_ref)
 
@@ -338,11 +426,14 @@ class HeadlessHarness:
         # The audited MJCF naturally lands into a folded prone pose before any
         # command is issued.  The other two cases add a controller-independent
         # preparation phase and then capture the resulting measured state.
+        self.set_phase("preparation-settle")
         self.run_for(1.2, None)
         if self.initial_condition == "asymmetric-prone":
+            self.set_phase("preparation-asymmetric-prone")
             self.interpolate_to(ASYMMETRIC_PRONE, 1.5)
             self.run_for(0.8, ASYMMETRIC_PRONE)
         elif self.initial_condition == "belly-loaded-prone":
+            self.set_phase("preparation-belly-loaded-prone")
             self.interpolate_to(BELLY_LOADED_PRONE, 1.5)
             self.run_for(0.8, BELLY_LOADED_PRONE)
         elif self.initial_condition != "normal":
@@ -352,7 +443,7 @@ class HeadlessHarness:
         return captured
 
     def adaptive_phase(self, name, source, target, duration_s, timeout_s, return_mode=False):
-        self.phase = "adaptive {}".format(name)
+        self.set_phase("adaptive {}".format(name))
         governor = control.ReferenceGovernor(source, target, duration_s, timeout_s)
         elapsed = 0.0
         while True:
@@ -455,7 +546,7 @@ class HeadlessHarness:
         self.controlled_return_succeeded = True
 
     def valid_contact_gate(self, q_ref):
-        self.phase = "WBC contact validation"
+        self.set_phase("WBC contact validation")
         gate = control.ContactValidityGate(0.5)
         hold_governor = control.ReferenceGovernor(
             q_ref,
@@ -517,7 +608,7 @@ class HeadlessHarness:
         baseline_height,
         solver,
     ):
-        self.phase = "WBC {}".format(name)
+        self.set_phase("WBC {}".format(name))
         governor = control.TaskProgressGovernor(duration_s, timeout_s)
         q_ref = np.asarray(q_ref, dtype=float)
         elapsed = 0.0
@@ -780,8 +871,19 @@ class HeadlessHarness:
         }
 
 
-def run_case(controller_name, gesture, initial_condition):
-    harness = HeadlessHarness(initial_condition)
+def run_case(
+    controller_name,
+    gesture,
+    initial_condition,
+    viewer_enabled=False,
+    viewer_speed=1.0,
+    viewer_hold=False,
+):
+    harness = HeadlessHarness(
+        initial_condition,
+        viewer_enabled=viewer_enabled,
+        viewer_speed=viewer_speed,
+    )
     captured = None
     error = None
     try:
@@ -792,7 +894,9 @@ def run_case(controller_name, gesture, initial_condition):
             harness.wbc_sequence(gesture, captured)
     except Exception as caught:
         error = "{}: {}".format(type(caught).__name__, caught)
-        if captured is not None:
+        if viewer_enabled:
+            print("[viewer] case stopped: {}".format(error), file=sys.stderr, flush=True)
+        if captured is not None and not isinstance(caught, ViewerClosed):
             harness.controlled_return_attempted = True
             try:
                 current = harness.state()[0].copy()
@@ -820,6 +924,8 @@ def run_case(controller_name, gesture, initial_condition):
     finally:
         if captured is None:
             captured = harness.state()[0].copy()
+        if viewer_hold:
+            harness.hold_viewer_until_closed()
         summary = harness.summary(controller_name, gesture, captured, error=error)
         harness.close()
     return summary
@@ -827,7 +933,7 @@ def run_case(controller_name, gesture, initial_condition):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Headless MuJoCo qualification for Go2W closed-loop gestures"
+        description="MuJoCo qualification and GUI inspection for Go2W closed-loop gestures"
     )
     parser.add_argument("--controller", choices=CONTROLLERS)
     parser.add_argument("--gesture", choices=GESTURES)
@@ -837,9 +943,35 @@ def parse_args(argv=None):
         default="all",
     )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument(
+        "--viewer",
+        action="store_true",
+        help="open MuJoCo's passive GUI for one selected initial condition",
+    )
+    parser.add_argument(
+        "--viewer-speed",
+        type=float,
+        default=1.0,
+        help="simulated-time / wall-time factor used by --viewer (default: 1.0)",
+    )
+    parser.add_argument(
+        "--viewer-hold",
+        action="store_true",
+        help="keep the final/failure state visible until the viewer window is closed",
+    )
     parser.add_argument("--describe", action="store_true")
     parser.add_argument("--doctor", action="store_true")
     return parser.parse_args(argv)
+
+
+def argument_error(args):
+    if args.viewer and args.initial == "all":
+        return "--viewer requires one explicit --initial condition, not 'all'"
+    if args.viewer_hold and not args.viewer:
+        return "--viewer-hold requires --viewer"
+    if not math.isfinite(args.viewer_speed) or args.viewer_speed <= 0.0:
+        return "--viewer-speed must be a positive finite number"
+    return None
 
 
 def main(argv=None):
@@ -847,8 +979,12 @@ def main(argv=None):
     if args.describe:
         describe(args.controller, args.gesture, args.initial)
         return 0
+    invalid = argument_error(args)
+    if invalid is not None:
+        print("error: {}".format(invalid), file=sys.stderr)
+        return 2
     reexec_with_simulator_python()
-    load_runtime()
+    load_runtime(enable_viewer=args.viewer)
     if args.doctor:
         return 0 if doctor() else 1
     if args.controller is None or args.gesture is None:
@@ -870,7 +1006,14 @@ def main(argv=None):
             ),
             flush=True,
         )
-        case = run_case(args.controller, args.gesture, initial_condition)
+        case = run_case(
+            args.controller,
+            args.gesture,
+            initial_condition,
+            viewer_enabled=args.viewer,
+            viewer_speed=args.viewer_speed,
+            viewer_hold=args.viewer_hold,
+        )
         cases.append(case)
         print(
             "{}: {}".format(
@@ -885,8 +1028,9 @@ def main(argv=None):
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = created_at.strftime("%Y%m%dT%H%M%S_%f%z")
-    output_path = output_dir / "{}_{}_{}_qualification.summary.json".format(
-        timestamp, args.controller, args.gesture
+    mode_suffix = "_viewer" if args.viewer else ""
+    output_path = output_dir / "{}_{}_{}{}_qualification.summary.json".format(
+        timestamp, args.controller, args.gesture, mode_suffix
     )
     overall_pass = all(case["simulation_pass"] for case in cases)
     document = {
@@ -894,6 +1038,8 @@ def main(argv=None):
         "created_at": created_at.isoformat(),
         "controller": args.controller,
         "gesture": args.gesture,
+        "execution_mode": "viewer-inspection" if args.viewer else "headless-qualification",
+        "viewer_speed": args.viewer_speed if args.viewer else None,
         "model_path": str(MODEL_XML),
         "model_sha256": control.MODEL_SOURCE_SHA256,
         "cases": cases,

@@ -215,6 +215,32 @@ written under `runs/mujoco/closed-loop/`; a nonzero result is retained as
 qualification evidence rather than bypassed. These headless results are
 simulation qualification only.
 
+To inspect the exact same adaptive/WBC controller path in MuJoCo's GUI, run one
+initial condition at a time:
+
+```bash
+make sim-view-adaptive-height
+make sim-view-adaptive-roll
+make sim-view-wbc-height
+make sim-view-wbc-roll
+```
+
+The default is `normal` at real-time speed. Select either prepared failure case
+or slow the display without changing simulated dynamics:
+
+```bash
+make sim-view-wbc-roll SIM_INITIAL=asymmetric-prone
+make sim-view-wbc-roll SIM_INITIAL=belly-loaded-prone VIEWER_SPEED=0.5
+```
+
+The terminal prints each controller phase while the passive viewer displays the
+same `MjModel`, `MjData`, 2 ms stepping, sensor inputs, and controller kernel as
+the headless harness. At completion or a watchdog failure, the final state stays
+visible until the MuJoCo window is closed; the summary is then written with
+`execution_mode: viewer-inspection`. Closing the window during motion aborts
+that case. Viewer runs are visual diagnostics; use the headless targets above as
+the timing and qualification authority.
+
 Launch the flat-scene GUI and the selected low-level controller from this
 repository:
 

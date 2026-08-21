@@ -158,13 +158,86 @@ class SimulationContractTests(unittest.TestCase):
                 "--gesture",
                 "roll",
                 "--initial",
-                "all",
+                "normal",
+                "--viewer",
+                "--viewer-speed",
+                "0.5",
+                "--viewer-hold",
             ],
         ):
             args = closed_loop.parse_args()
         self.assertEqual(args.controller, "wbc")
         self.assertEqual(args.gesture, "roll")
-        self.assertEqual(args.initial, "all")
+        self.assertEqual(args.initial, "normal")
+        self.assertTrue(args.viewer)
+        self.assertEqual(args.viewer_speed, 0.5)
+        self.assertTrue(args.viewer_hold)
+        self.assertIsNone(closed_loop.argument_error(args))
+
+    def test_closed_loop_viewer_rejects_multi_case_and_invalid_pacing(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["closed-loop", "--viewer", "--initial", "all"],
+        ):
+            args = closed_loop.parse_args()
+        self.assertIn("one explicit", closed_loop.argument_error(args))
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "closed-loop",
+                "--viewer",
+                "--initial",
+                "normal",
+                "--viewer-speed",
+                "0",
+            ],
+        ):
+            args = closed_loop.parse_args()
+        self.assertIn("positive finite", closed_loop.argument_error(args))
+
+        with mock.patch.object(sys, "argv", ["closed-loop", "--viewer-hold"]):
+            args = closed_loop.parse_args()
+        self.assertIn("requires --viewer", closed_loop.argument_error(args))
+
+    def test_closed_loop_viewer_syncs_and_paces_against_simulated_time(self):
+        harness = object.__new__(closed_loop.HeadlessHarness)
+        harness.viewer = mock.Mock()
+        harness.viewer.is_running.return_value = True
+        harness.viewer_speed = 2.0
+        harness._viewer_wall_start = 10.0
+        harness._viewer_sim_start = 0.0
+        harness.data = mock.Mock(time=0.2)
+
+        with (
+            mock.patch.object(closed_loop.time, "monotonic", return_value=10.05),
+            mock.patch.object(closed_loop.time, "sleep") as sleep_mock,
+        ):
+            harness._sync_viewer()
+
+        harness.viewer.sync.assert_called_once_with()
+        sleep_mock.assert_called_once()
+        self.assertAlmostEqual(sleep_mock.call_args.args[0], 0.05)
+
+        harness.viewer.is_running.return_value = False
+        with self.assertRaises(closed_loop.ViewerClosed):
+            harness._sync_viewer()
+
+    def test_closed_loop_viewer_hold_handles_terminal_interrupt(self):
+        harness = object.__new__(closed_loop.HeadlessHarness)
+        harness.viewer = mock.Mock()
+        harness.viewer.is_running.return_value = True
+        harness.viewer.sync.side_effect = KeyboardInterrupt
+
+        with mock.patch("builtins.print") as print_mock:
+            harness.hold_viewer_until_closed()
+
+        self.assertIn(
+            "interrupted",
+            print_mock.call_args_list[-1].args[0],
+        )
 
     def test_closed_loop_controller_state_uses_imu_sensor_not_ground_truth_pose(self):
         source = Path(closed_loop.__file__).read_text(encoding="utf-8")
@@ -221,7 +294,7 @@ class SimulationContractTests(unittest.TestCase):
 
     def test_closed_loop_failure_attempts_adaptive_captured_prone_return(self):
         class FakeHarness:
-            def __init__(self, initial_condition):
+            def __init__(self, initial_condition, **_kwargs):
                 self.initial_condition = initial_condition
                 self.controlled_return_attempted = False
                 self.controlled_return_succeeded = False
