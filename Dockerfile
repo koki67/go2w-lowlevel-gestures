@@ -74,6 +74,7 @@ COPY go2w_gesture_real_no_tracking_stop.py /app/go2w_gesture_real_no_tracking_st
 COPY go2w_gesture_real_fast_no_tracking_stop.py /app/go2w_gesture_real_fast_no_tracking_stop.py
 COPY go2w_closed_loop_control.py /app/go2w_closed_loop_control.py
 COPY go2w_gesture_real_adaptive.py /app/go2w_gesture_real_adaptive.py
+COPY go2w_gesture_real_wbc.py /app/go2w_gesture_real_wbc.py
 COPY simulation /app/simulation
 COPY tests /app/tests
 
@@ -83,6 +84,7 @@ RUN python -m unittest discover -s /app/tests -v \
     && python /app/go2w_gesture_real_no_tracking_stop.py --describe \
     && python /app/go2w_gesture_real_fast_no_tracking_stop.py --describe \
     && python /app/go2w_gesture_real_adaptive.py --describe \
+    && python /app/go2w_gesture_real_wbc.py --describe \
     && python /app/simulation/go2w_height_sequence_sim.py --describe \
     && python /app/simulation/go2w_roll_sequence_sim.py --describe \
     && python /app/simulation/go2w_quick_stand_sequence_sim.py --describe \

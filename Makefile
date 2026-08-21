@@ -6,6 +6,7 @@ FAST_SCRIPT := /app/go2w_gesture_real_fast.py
 NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_no_tracking_stop.py
 FAST_NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_fast_no_tracking_stop.py
 ADAPTIVE_SCRIPT := /app/go2w_gesture_real_adaptive.py
+WBC_SCRIPT := /app/go2w_gesture_real_wbc.py
 HOST_PYTHON ?= python3
 UNITREE_MUJOCO_ROOT ?= $(abspath ../unitree_mujoco)
 UNITREE_MUJOCO_PYTHON ?= $(UNITREE_MUJOCO_ROOT)/simulate_python/.venv/bin/python
@@ -24,18 +25,21 @@ endif
 	describe-no-tracking-stop describe-no-tracking-stop-height describe-no-tracking-stop-roll \
 	describe-fast-no-tracking-stop describe-fast-no-tracking-stop-height describe-fast-no-tracking-stop-roll \
 	describe-adaptive-height describe-adaptive-roll \
+	describe-wbc-height describe-wbc-roll \
 	describe-height describe-roll \
 	preflight-slow-height preflight-slow-roll \
 	preflight-fast-height preflight-fast-roll \
 	preflight-no-tracking-stop-height preflight-no-tracking-stop-roll \
 	preflight-fast-no-tracking-stop-height preflight-fast-no-tracking-stop-roll \
 	preflight-adaptive-height preflight-adaptive-roll \
+	preflight-wbc-height preflight-wbc-roll \
 	preflight-height preflight-roll \
 	live-slow-height live-slow-roll \
 	live-fast-height live-fast-roll \
 	live-no-tracking-stop-height live-no-tracking-stop-roll \
 	live-fast-no-tracking-stop-height live-fast-no-tracking-stop-roll \
 	live-adaptive-height live-adaptive-roll \
+	live-wbc-height live-wbc-roll \
 	live-height live-roll \
 	sim-doctor sim-describe sim-describe-height sim-describe-roll \
 	sim-describe-quick-stand sim-describe-shake-off \
@@ -53,6 +57,8 @@ help:
 	@echo "Fast 1.0/0.5, no tracking-error stop: make live-fast-no-tracking-stop-height | live-fast-no-tracking-stop-roll"
 	@echo "Adaptive fast read-only: make preflight-adaptive-height | preflight-adaptive-roll"
 	@echo "Adaptive fast physical:  make live-adaptive-height | live-adaptive-roll"
+	@echo "Quasi-static WBC read-only: make preflight-wbc-height | preflight-wbc-roll"
+	@echo "Quasi-static WBC physical:  make live-wbc-height | live-wbc-roll"
 	@echo "Compatibility: preflight-height/roll and live-height/roll use slow"
 	@echo "MuJoCo requirement check: make sim-doctor"
 	@echo "MuJoCo runs: make sim-height | sim-roll | sim-quick-stand | sim-shake-off"
@@ -120,6 +126,14 @@ describe-adaptive-height:
 describe-adaptive-roll:
 	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
 		$(SERVICE) $(ADAPTIVE_SCRIPT) --gesture roll --describe
+
+describe-wbc-height:
+	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
+		$(SERVICE) $(WBC_SCRIPT) --gesture height --describe
+
+describe-wbc-roll:
+	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
+		$(SERVICE) $(WBC_SCRIPT) --gesture roll --describe
 
 describe-height: describe-slow-height
 
@@ -203,6 +217,14 @@ preflight-adaptive-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
 		$(SERVICE) $(ADAPTIVE_SCRIPT) --gesture roll
 
+preflight-wbc-height:
+	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+		$(SERVICE) $(WBC_SCRIPT) --gesture height
+
+preflight-wbc-roll:
+	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+		$(SERVICE) $(WBC_SCRIPT) --gesture roll
+
 preflight-height: preflight-slow-height
 
 preflight-roll: preflight-slow-roll
@@ -246,6 +268,14 @@ live-adaptive-height:
 live-adaptive-roll:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
 		$(SERVICE) $(ADAPTIVE_SCRIPT) --gesture roll --live
+
+live-wbc-height:
+	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+		$(SERVICE) $(WBC_SCRIPT) --gesture height --live
+
+live-wbc-roll:
+	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+		$(SERVICE) $(WBC_SCRIPT) --gesture roll --live
 
 live-height: live-slow-height
 
