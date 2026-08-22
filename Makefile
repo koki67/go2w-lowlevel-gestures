@@ -80,7 +80,7 @@ help:
 	@echo "MuJoCo runs: make sim-height | sim-roll | sim-quick-stand | sim-shake-off"
 	@echo "Closed-loop MuJoCo: make sim-closed-loop-deps, then sim-adaptive-height | sim-adaptive-roll | sim-wbc-height | sim-wbc-roll"
 	@echo "Closed-loop MuJoCo GUI: make sim-view-adaptive-height | sim-view-adaptive-roll | sim-view-wbc-height | sim-view-wbc-roll"
-	@echo "Adaptive SVG plots: make sim-adaptive-height save-plot (or a sim-view-adaptive-* target)"
+	@echo "Closed-loop SVG plots: add save-plot to an adaptive/WBC headless or GUI target"
 	@echo "GUI initial/speed override: SIM_INITIAL=asymmetric-prone VIEWER_SPEED=0.5"
 	@echo "Quick stand: low -> high in 0.1 s (simulation only)"
 	@echo "Shake off: 8 rapid right/left cycles (simulation only)"
@@ -224,12 +224,12 @@ sim-adaptive-roll:
 sim-wbc-height:
 	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
 		$(SIM_DIR)/go2w_closed_loop_sequence_sim.py \
-		--controller wbc --gesture height --initial all $(SIM_ARGS)
+		--controller wbc --gesture height --initial all $(SIM_RUN_ARGS)
 
 sim-wbc-roll:
 	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
 		$(SIM_DIR)/go2w_closed_loop_sequence_sim.py \
-		--controller wbc --gesture roll --initial all $(SIM_ARGS)
+		--controller wbc --gesture roll --initial all $(SIM_RUN_ARGS)
 
 sim-view-adaptive-height:
 	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
@@ -247,13 +247,13 @@ sim-view-wbc-height:
 	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
 		$(SIM_DIR)/go2w_closed_loop_sequence_sim.py \
 		--controller wbc --gesture height --initial '$(SIM_INITIAL)' \
-		--viewer --viewer-speed '$(VIEWER_SPEED)' --viewer-hold $(SIM_ARGS)
+		--viewer --viewer-speed '$(VIEWER_SPEED)' --viewer-hold $(SIM_RUN_ARGS)
 
 sim-view-wbc-roll:
 	$(CLOSED_LOOP_SIM_ENV) $(HOST_PYTHON) \
 		$(SIM_DIR)/go2w_closed_loop_sequence_sim.py \
 		--controller wbc --gesture roll --initial '$(SIM_INITIAL)' \
-		--viewer --viewer-speed '$(VIEWER_SPEED)' --viewer-hold $(SIM_ARGS)
+		--viewer --viewer-speed '$(VIEWER_SPEED)' --viewer-hold $(SIM_RUN_ARGS)
 
 save-plot:
 	@:

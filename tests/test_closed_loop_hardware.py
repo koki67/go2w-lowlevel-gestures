@@ -210,8 +210,19 @@ class WBCHardwareTests(unittest.TestCase):
 
         controller._wait_for_valid_contact_estimate = mock.Mock(side_effect=contact_gate)
         controller._hold_while_confirming_support = mock.Mock()
+
+        def wbc_phase(
+            _name,
+            _current,
+            _posture_source,
+            posture_target,
+            *_args,
+            **_kwargs
+        ):
+            return list(posture_target)
+
         controller._run_wbc_phase = mock.Mock(
-            side_effect=lambda _name, _current, _posture_source, posture_target, *_args: list(posture_target)
+            side_effect=wbc_phase
         )
         controller._finish_adaptive_at_prone = mock.Mock()
         return controller
@@ -221,14 +232,15 @@ class WBCHardwareTests(unittest.TestCase):
             with self.subTest(gesture=gesture):
                 controller = self.make_controller(gesture)
                 controller._run_wbc_sequence()
-                self.assertEqual(controller._run_wbc_phase.call_count, 12)
+                self.assertEqual(controller._run_wbc_phase.call_count, 14)
                 phase_names = [
                     call.args[0] for call in controller._run_wbc_phase.call_args_list
                 ]
                 self.assertEqual(
-                    sum(name.startswith("transition") for name in phase_names), 6
+                    sum(name.startswith("transition") for name in phase_names), 7
                 )
                 self.assertEqual(sum(name.startswith("hold") for name in phase_names), 6)
+                self.assertIn("settle final standard", phase_names)
                 controller._finish_adaptive_at_prone.assert_called_once()
                 controller._wait_for_valid_contact_estimate.assert_called_once()
                 controller._hold_while_confirming_support.assert_called_once()

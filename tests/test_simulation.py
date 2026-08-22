@@ -1,9 +1,12 @@
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import xml.etree.ElementTree as ET
+
+import numpy as np
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +21,7 @@ import go2w_roll_sequence_sim as roll
 import go2w_shake_off_sequence_sim as shake_off
 import go2w_adaptive_plot as adaptive_plot
 import go2w_closed_loop_sequence_sim as closed_loop
+import go2w_wbc_plot as wbc_plot
 
 
 class SimulationContractTests(unittest.TestCase):
@@ -50,7 +54,7 @@ class SimulationContractTests(unittest.TestCase):
         self.assertTrue(args.save_plot)
         self.assertIsNone(closed_loop.argument_error(args))
 
-    def test_closed_loop_plot_rejects_wbc_to_avoid_mislabelled_governor_output(self):
+    def test_closed_loop_plot_accepts_wbc_controller_diagnostics(self):
         with mock.patch.object(
             sys,
             "argv",
@@ -64,7 +68,8 @@ class SimulationContractTests(unittest.TestCase):
             ],
         ):
             args = closed_loop.parse_args()
-        self.assertIn("requires --controller adaptive", closed_loop.argument_error(args))
+        self.assertTrue(args.save_plot)
+        self.assertIsNone(closed_loop.argument_error(args))
 
     def test_tracking_samples_are_only_buffered_when_plot_saving_is_enabled(self):
         def make_controller(save_plot):
@@ -196,6 +201,212 @@ class SimulationContractTests(unittest.TestCase):
         self.assertEqual(artifacts["sample_count"], 123)
         self.assertEqual(artifacts["generation_error"], None)
         self.assertEqual(artifacts["adaptive_governor_svg"], "/tmp/governor.svg")
+
+    def test_wbc_plot_recording_is_opt_in_and_writes_five_valid_svgs(self):
+        names = tuple("joint_{}".format(index) for index in range(12))
+        envelopes = (0.2,) * 12
+        torque_limits = (23.7,) * 8 + (45.43,) * 4
+
+        def make_recorder(enabled):
+            return wbc_plot.WBCPlotRecorder(
+                enabled,
+                names,
+                envelopes,
+                torque_limits,
+                body_weight_n=187.63,
+                tilt_limit_rad=0.55,
+                max_commanded_dq_rad_s=1.0,
+                max_commanded_ddq_rad_s2=4.0,
+                wbc_period_s=0.01,
+            )
+
+        contact = SimpleNamespace(
+            forces=(
+                (1.0, 0.0, 45.0),
+                (-1.0, 0.0, 49.0),
+                (0.5, 0.0, 44.0),
+                (-0.5, 0.0, 49.63),
+            ),
+            valid=True,
+            reason=None,
+            total_vertical_load_n=187.63,
+            minimum_normal_load_n=44.0,
+            torque_residual_ratio=0.08,
+            balance_residual_ratio=0.06,
+            max_jacobian_condition=15.0,
+            solve_time_s=0.001,
+            iterations=75,
+        )
+        task_target = SimpleNamespace(
+            relative_height_m=0.02,
+            roll_rad=0.20,
+            pitch_rad=0.0,
+            yaw_rad=0.0,
+        )
+        task_estimate = SimpleNamespace(
+            relative_height_m=0.018,
+            roll_rad=0.19,
+            pitch_rad=0.01,
+            yaw_rad=0.005,
+        )
+        qp = SimpleNamespace(
+            generalized_velocity=(0.0,) * 6 + (0.1,) * 12,
+            valid=True,
+            reason=None,
+            solve_time_s=0.003,
+            iterations=100,
+            primal_residual=1.0e-5,
+            dual_residual=2.0e-5,
+            contact_velocity_residual_m_s=0.002,
+        )
+        record_arguments = {
+            "time_s": 0.0,
+            "phase": "transition-1-right",
+            "q_ref": (0.1,) * 12,
+            "q_measured": (0.09,) * 12,
+            "measured_dq": (0.02,) * 12,
+            "tau_est": (2.0,) * 12,
+            "body_rpy": (0.19, 0.01, 0.005),
+            "progress": 0.5,
+            "speed_scale": 0.8,
+            "task_target": task_target,
+            "task_estimate": task_estimate,
+            "contact": contact,
+            "qp_result": qp,
+            "support_y_m": (-0.15, 0.15, -0.15, 0.15),
+        }
+        disabled = make_recorder(False)
+        disabled.record(**record_arguments)
+        self.assertEqual(disabled.samples, [])
+
+        recorder = make_recorder(True)
+        for index in range(8):
+            arguments = dict(record_arguments)
+            arguments["time_s"] = 0.01 * index
+            if index >= 4:
+                arguments["phase"] = "hold-1-right"
+            if index == 7:
+                arguments["event"] = "contact balance residual exceeded limit"
+            recorder.record(**arguments)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            artifacts = recorder.write(Path(temporary_directory), "wbc-test")
+            expected_keys = (
+                "joint_tracking_svg",
+                "wbc_task_tracking_svg",
+                "wbc_contact_support_svg",
+                "wbc_contact_qp_health_svg",
+                "wbc_solver_safety_svg",
+            )
+            self.assertEqual(artifacts["sample_count"], 8)
+            for key in expected_keys:
+                path = Path(artifacts[key])
+                self.assertTrue(path.is_file())
+                ET.parse(path)
+            self.assertIn(
+                "WBC target",
+                Path(artifacts["joint_tracking_svg"]).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "WBC task-space tracking",
+                Path(artifacts["wbc_task_tracking_svg"]).read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertIn(
+                "Estimated lateral CoP",
+                Path(artifacts["wbc_contact_support_svg"]).read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertIn(
+                "25% limit",
+                Path(artifacts["wbc_contact_qp_health_svg"]).read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertIn(
+                "runtime stop",
+                Path(artifacts["wbc_solver_safety_svg"]).read_text(
+                    encoding="utf-8"
+                ),
+            )
+
+    def test_wbc_runtime_plot_samples_are_limited_to_the_100_hz_control_rate(self):
+        harness = object.__new__(closed_loop.HeadlessHarness)
+        harness._wbc_plot_time_origin_s = 0.0
+        harness._last_wbc_plot_sample_time_s = None
+        harness.data = SimpleNamespace(time=0.0)
+        recorder = mock.Mock(enabled=True)
+        harness._wbc_plot_recorder = recorder
+        fake_control = SimpleNamespace(
+            WBC_PERIOD_S=0.01,
+            wheel_positions=lambda _q: np.zeros((4, 3)),
+            rpy_rotation=lambda _rpy: np.eye(3),
+        )
+        state = (
+            [0.0] * 12,
+            [0.0] * 12,
+            [0.0] * 12,
+            [0.0] * 12,
+            [0.0] * 3,
+        )
+        with mock.patch.object(closed_loop, "control", fake_control):
+            harness._record_wbc_plot_sample("phase", *state)
+            harness.data.time = 0.002
+            harness._record_wbc_plot_sample("phase", *state)
+            harness.data.time = 0.010
+            harness._record_wbc_plot_sample("phase", *state)
+            harness.data.time = 0.012
+            harness._record_wbc_plot_sample("phase", *state, event="failure")
+        self.assertEqual(recorder.record.call_count, 3)
+
+    def test_run_case_attaches_requested_wbc_plot_artifacts(self):
+        class FakeHarness:
+            def __init__(self, initial_condition, **kwargs):
+                self.initial_condition = initial_condition
+                self.wbc_recording_requested = kwargs["record_wbc_plot"]
+                self.adaptive_recording_requested = kwargs[
+                    "record_adaptive_plot"
+                ]
+
+            def prepare(self):
+                return [0.0] * 12
+
+            def wbc_sequence(self, _gesture, _captured):
+                pass
+
+            def write_wbc_plots(self, output_dir, stem):
+                self.plot_call = (Path(output_dir), stem)
+                return {
+                    "sample_count": 456,
+                    "joint_tracking_svg": "/tmp/wbc-joints.svg",
+                    "wbc_task_tracking_svg": "/tmp/wbc-task.svg",
+                    "wbc_contact_support_svg": "/tmp/wbc-support.svg",
+                    "wbc_contact_qp_health_svg": "/tmp/wbc-contact.svg",
+                    "wbc_solver_safety_svg": "/tmp/wbc-solver.svg",
+                }
+
+            def summary(self, _controller, _gesture, _captured, error=None):
+                return {"simulation_pass": error is None, "error": error}
+
+            def close(self):
+                pass
+
+        with mock.patch.object(closed_loop, "HeadlessHarness", FakeHarness):
+            summary = closed_loop.run_case(
+                "wbc",
+                "roll",
+                "normal",
+                save_plot=True,
+                plot_output_dir="/tmp/output",
+                plot_stem="run-normal",
+            )
+        artifacts = summary["plot_artifacts"]
+        self.assertTrue(artifacts["requested"])
+        self.assertEqual(artifacts["sample_count"], 456)
+        self.assertEqual(artifacts["generation_error"], None)
+        self.assertEqual(artifacts["wbc_task_tracking_svg"], "/tmp/wbc-task.svg")
 
     def test_height_targets_are_owned_by_hardware_controller(self):
         self.assertEqual(height.STANDARD, hardware.STANDARD)

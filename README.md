@@ -138,8 +138,15 @@ The WBC target offsets relative to the captured STANDARD state are:
 | --- | --- |
 | Height low | `-0.093178 m` |
 | Height high | `+0.076281 m` |
-| Roll right | `-0.395469 rad` (about `-22.659 degrees`) |
-| Roll left | `+0.395469 rad` (about `+22.659 degrees`) |
+| Roll right | `-0.35 rad` (about `-20.054 degrees`) |
+| Roll left | `+0.35 rad` (about `+20.054 degrees`) |
+
+The earlier WBC roll target of `+/-0.395469 rad` transiently lifted an inside
+wheel in the flat-floor MuJoCo qualification. The WBC-only target is therefore
+limited to `+/-0.35 rad`; the existing scripted joint-space roll poses are not
+changed. Roll WBC uses STANDARD as its secondary posture objective so the task
+QP, rather than the scripted roll pose, determines the load-bearing joint
+configuration.
 
 Roll and pitch come from the IMU. Relative height comes from leg kinematics
 and estimated wheel loads; it is not claimed as absolute world height. Contact
@@ -162,6 +169,17 @@ changes, increases in `lost`, tilt, DDS failures, solver failure, and timing
 failure. Temperature and power are recorded but have no invented absolute stop
 threshold. Neither controller retries automatically or falls back to a
 no-tracking-stop script.
+
+The kinematic WBC keeps its 100 Hz QP period and the 10 ms fail-closed runtime
+limit. Its fixed-size OSQP workspace and initial factorization are created
+during preflight, then updated and warm-started instead of being rebuilt every
+cycle.
+Estimated minimum wheel load additionally slows progress below 10% of body
+weight, backs away from the endpoint at or below 6%, requests a controlled
+return below 4% for 0.10 s, and must be at least 8% for roll completion. These
+are model-derived operational margins, not measured wheel loads or physical
+qualification. After the gesture, WBC explicitly returns to and settles the
+STANDARD task before the existing adaptive prone return.
 
 The first physical trial is intentionally configured for the full task target
 and all three cycles, following the selected test protocol. That is riskier
@@ -228,8 +246,8 @@ written under `runs/mujoco/closed-loop/`; a nonzero result is retained as
 qualification evidence rather than bypassed. These headless results are
 simulation qualification only.
 
-Adaptive runs can additionally save two human-readable SVGs by adding the
-opt-in `save-plot` goal:
+Closed-loop runs do not buffer or write plot data by default. Adaptive runs can
+save two human-readable SVGs by adding the opt-in `save-plot` goal:
 
 ```bash
 make sim-adaptive-height save-plot
@@ -249,6 +267,36 @@ out case still writes the samples captured before and during its adaptive
 return. The summary JSON records both artifact paths and whether plot
 generation succeeded.
 
+WBC runs use the same opt-in goal and save five controller-specific SVGs:
+
+```bash
+make sim-wbc-height save-plot
+make sim-wbc-roll save-plot
+```
+
+The files show:
+
+1. all 12 WBC position-PD references against measured joint angles;
+2. relative height, roll, pitch, and yaw targets against controller estimates,
+   including the height-gesture `+/-0.015 m`, roll-gesture `+/-0.020 m`, and
+   roll/pitch `+/-2 deg` endpoint bands;
+3. estimated normal load at each wheel, total and left/right support load,
+   lateral center of pressure, and the 10%/6%/4% controller support margins;
+4. contact-force QP validity, torque and force/moment residuals, Jacobian
+   condition number, solve time, and iterations; and
+5. WBC QP solve time/residuals, wheel-velocity residual, velocity/acceleration
+   bound utilization, joint tracking, `tau_est`, and body-tilt safety margins.
+
+The support plots are based on `tau_est` and the modeled Jacobians; they are not
+direct foot-force measurements. Height is relative to the validated STANDARD
+pose, not an absolute world height. Failed contact validation, QP rejection, or
+a later controlled return remains visible in the saved samples. SVG files are
+written only after the controller case has stopped. Non-event WBC plot samples
+are decimated to the 100 Hz QP rate so GUI rendering plus `save-plot` does not
+buffer redundant 500 Hz points; live 500 Hz deadline-miss
+evidence remains in the hardware CSV/summary rather than being synthesized by
+MuJoCo. These plots are simulation diagnostics, not physical qualification.
+
 To inspect the exact same adaptive/WBC controller path in MuJoCo's GUI, run one
 initial condition at a time:
 
@@ -259,11 +307,14 @@ make sim-view-wbc-height
 make sim-view-wbc-roll
 ```
 
-The same adaptive plots can be saved after closing the GUI viewer:
+The corresponding adaptive or WBC plots can be saved after closing the GUI
+viewer:
 
 ```bash
 make sim-view-adaptive-height save-plot
 make sim-view-adaptive-roll save-plot SIM_INITIAL=normal
+make sim-view-wbc-height save-plot
+make sim-view-wbc-roll save-plot SIM_INITIAL=normal
 ```
 
 The default is `normal` at real-time speed. Select either prepared failure case

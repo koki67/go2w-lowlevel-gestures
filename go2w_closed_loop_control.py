@@ -96,8 +96,12 @@ WHEEL_MASS_KG = 0.98
 
 HEIGHT_LOW_REL_M = -0.093178
 HEIGHT_HIGH_REL_M = 0.076281
-ROLL_RIGHT_REL_RAD = -0.395469
-ROLL_LEFT_REL_RAD = 0.395469
+# The original +/-0.395469 rad WBC task lifted an inside wheel in the audited
+# flat-floor MuJoCo model.  A 0.35 rad task retains a roughly 20 degree visible
+# gesture while preserving four-wheel ground-truth contact in the qualification
+# sequence.  The separately defined scripted joint-space poses are unchanged.
+ROLL_RIGHT_REL_RAD = -0.35
+ROLL_LEFT_REL_RAD = 0.35
 
 FAST_TRANSITION_TIMEOUT_S = 8.0
 STARTUP_TIMEOUT_S = 12.0
@@ -117,7 +121,10 @@ CONVERGENCE_NUMERIC_MARGIN_RAD = 0.001
 LOADED_ROLL_COMPLETION_RATIO = 0.70
 LOADED_ROLL_PD_RESIDUAL_RATIO = 0.10
 LOADED_ROLL_MAX_DQ_RAD_S = 0.02
-LOADED_ROLL_MIN_SIGNED_BODY_ROLL_RAD = 0.50 * abs(ROLL_RIGHT_REL_RAD)
+ADAPTIVE_ROLL_REFERENCE_REL_RAD = 0.395469
+LOADED_ROLL_MIN_SIGNED_BODY_ROLL_RAD = (
+    0.50 * ADAPTIVE_ROLL_REFERENCE_REL_RAD
+)
 # The existing adaptive joint targets produce these signs in the Unitree IMU
 # roll convention (right target positive, left target negative).  WBC task
 # target signs describe a different task-space convention and are not reused.
@@ -138,13 +145,31 @@ WBC_MAX_SOLVE_S = 0.010
 # meet the strict residual bounds from a cold start.  The fixed ceiling remains
 # comfortably inside the separately enforced 10 ms wall-time limit.
 WBC_MAX_ITER = 1000
-WBC_EPS_ABS = 1.0e-5
-WBC_EPS_REL = 1.0e-5
+WBC_EPS_ABS = 1.0e-6
+WBC_EPS_REL = 1.0e-6
 # Acceptance is checked independently of OSQP's scaled stopping test.  The
-# 5e-4 fixed bound rejects materially inaccurate solutions while avoiding a
-# false trip at the 1e-4 floating-point boundary seen after warm starts.
+# 5e-4 fixed bound rejects materially inaccurate solutions.  OSQP's internal
+# tolerance is deliberately tighter because its relative stopping test can
+# otherwise report solved with a dual residual just above this independent
+# fail-closed ceiling after a large roll-direction reversal.
 WBC_MAX_PRIMAL_RESIDUAL = 5.0e-4
 WBC_MAX_DUAL_RESIDUAL = 5.0e-4
+
+# Operational support margins are deliberately stricter than the estimator's
+# mathematical 1%-of-body-weight validity floor.  A WBC path slows below the
+# warning margin, backs away from its endpoint below the backoff margin, and
+# requests a controlled return if the return margin persists.  These remain
+# provisional application values, not direct foot-force measurements or
+# hardware-qualified limits.
+WBC_SUPPORT_SLOW_RATIO = 0.10
+WBC_SUPPORT_BACKOFF_RATIO = 0.06
+WBC_SUPPORT_RETURN_RATIO = 0.04
+WBC_SUPPORT_COMPLETION_RATIO = 0.08
+WBC_HEIGHT_TOLERANCE_M = 0.015
+WBC_ROLL_HEIGHT_TOLERANCE_M = 0.020
+WBC_ANGLE_TOLERANCE_RAD = math.radians(2.0)
+WBC_ROLL_TRANSITION_TIMEOUT_S = 10.0
+WBC_STANDARD_RETURN_TIMEOUT_S = 10.0
 
 
 def _vector(values: Sequence[float], length: int, name: str) -> np.ndarray:
@@ -378,6 +403,7 @@ class LoadedRollEquilibriumStatus:
     low_velocity_met: bool
     torque_margin_met: bool
     roll_direction_met: bool
+    additional_condition_met: bool
 
 
 class LoadedRollEquilibriumGate:
@@ -429,6 +455,7 @@ class LoadedRollEquilibriumGate:
         dt_s: float,
         *,
         endpoint_reached: bool,
+        additional_condition: bool = True,
     ) -> LoadedRollEquilibriumStatus:
         target = _vector(target_q, 12, "target_q")
         measured = _vector(measured_q, 12, "measured_q")
@@ -479,6 +506,7 @@ class LoadedRollEquilibriumGate:
             and low_velocity_met
             and torque_margin_met
             and roll_direction_met
+            and bool(additional_condition)
         )
         self.accumulated_s = self.accumulated_s + dt_s if settled else 0.0
 
@@ -496,6 +524,7 @@ class LoadedRollEquilibriumGate:
             low_velocity_met=low_velocity_met,
             torque_margin_met=torque_margin_met,
             roll_direction_met=roll_direction_met,
+            additional_condition_met=bool(additional_condition),
         )
 
 
@@ -534,6 +563,7 @@ class TaskProgressGovernor:
         self.progress = 0.0
         self._tracking_over_s = 0.0
         self._torque_over_s = 0.0
+        self._support_over_s = 0.0
         self._settled_s = 0.0
 
     def step(
@@ -546,6 +576,8 @@ class TaskProgressGovernor:
         wall_elapsed_s: float,
         *,
         task_within_tolerance: bool,
+        minimum_normal_load_n: Optional[float] = None,
+        body_weight_n: float = BODY_WEIGHT_N,
     ) -> TaskProgressDecision:
         command = _vector(command_q, 12, "command_q")
         measured = _vector(measured_q, 12, "measured_q")
@@ -553,6 +585,14 @@ class TaskProgressGovernor:
         torque = _vector(tau_est, 12, "tau_est")
         if dt_s < 0.0 or not math.isfinite(dt_s):
             raise ValueError("dt_s must be finite and nonnegative")
+        if not math.isfinite(body_weight_n) or body_weight_n <= 0.0:
+            raise ValueError("body_weight_n must be positive and finite")
+        support_ratio = float("inf")
+        if minimum_normal_load_n is not None:
+            support_load = float(minimum_normal_load_n)
+            if not math.isfinite(support_load):
+                raise ValueError("minimum_normal_load_n must be finite when supplied")
+            support_ratio = support_load / body_weight_n
         tracking_ratio = float(np.max(np.abs(command - measured) / self.envelopes))
         torque_ratio = float(np.max(np.abs(torque) / self.torque_limits))
         timed_out = wall_elapsed_s > self.timeout_s
@@ -565,9 +605,17 @@ class TaskProgressGovernor:
             if torque_ratio >= TORQUE_RETURN_RATIO
             else 0.0
         )
+        self._support_over_s = (
+            self._support_over_s + dt_s
+            if support_ratio < WBC_SUPPORT_RETURN_RATIO
+            else 0.0
+        )
         tracking_return = self._tracking_over_s >= PERSISTENCE_S
         torque_return = self._torque_over_s >= PERSISTENCE_S
-        request_return = timed_out or tracking_return or torque_return
+        support_return = self._support_over_s >= PERSISTENCE_S
+        request_return = (
+            timed_out or tracking_return or torque_return or support_return
+        )
 
         reason = None
         if emergency:
@@ -578,16 +626,41 @@ class TaskProgressGovernor:
             reason = "WBC q_ref envelope exceeded continuously for 0.10 s"
         elif torque_return:
             reason = "tau_est exceeded 85% continuously for 0.10 s"
+        elif support_return:
+            reason = (
+                "minimum estimated wheel load stayed below {:.0%} of body "
+                "weight for 0.10 s"
+            ).format(WBC_SUPPORT_RETURN_RATIO)
         warning = None
         if torque_ratio >= TORQUE_WARN_RATIO:
             warning = (
                 "provisional tau_est protection active at {:.1%} of model range"
             ).format(torque_ratio)
+        elif support_ratio < WBC_SUPPORT_SLOW_RATIO:
+            warning = (
+                "estimated wheel-load margin active at {:.1%} of body weight"
+            ).format(support_ratio)
 
         tracking_scale = ReferenceGovernor._tracking_speed_scale(tracking_ratio)
         torque_scale = 0.0 if torque_ratio >= TORQUE_STOP_RATIO else 1.0
-        speed_scale = min(tracking_scale, torque_scale)
-        if not request_return and not emergency:
+        if support_ratio >= WBC_SUPPORT_SLOW_RATIO:
+            support_scale = 1.0
+        elif support_ratio > WBC_SUPPORT_BACKOFF_RATIO:
+            support_scale = (
+                support_ratio - WBC_SUPPORT_BACKOFF_RATIO
+            ) / (WBC_SUPPORT_SLOW_RATIO - WBC_SUPPORT_BACKOFF_RATIO)
+        else:
+            support_scale = 0.0
+        speed_scale = min(tracking_scale, torque_scale, support_scale)
+        if (
+            not request_return
+            and not emergency
+            and support_ratio <= WBC_SUPPORT_BACKOFF_RATIO
+        ):
+            # Retreat toward the phase source while the estimate is still
+            # mathematically valid, before the fail-closed contact gate trips.
+            self.progress = max(0.0, self.progress - dt_s / self.duration_s)
+        elif not request_return and not emergency:
             self.progress = min(
                 1.0,
                 self.progress + dt_s * speed_scale / self.duration_s,
@@ -618,6 +691,32 @@ class TaskProgressGovernor:
             warning=warning,
             reason=reason,
         )
+
+
+def wbc_task_within_tolerance(
+    gesture: str,
+    estimate: "TaskSpaceEstimate",
+    target: "WBCTarget",
+) -> bool:
+    """Return the task endpoint tolerance shared by hardware and MuJoCo."""
+
+    if gesture == "height":
+        height_tolerance = WBC_HEIGHT_TOLERANCE_M
+    elif gesture == "roll":
+        # The kinematic roll controller holds a small vertical PD offset while
+        # maintaining its load-bearing task.  Keep it explicitly bounded and
+        # separate from the tighter height-gesture acceptance band.
+        height_tolerance = WBC_ROLL_HEIGHT_TOLERANCE_M
+    else:
+        raise ValueError("unsupported WBC gesture: {!r}".format(gesture))
+    return (
+        abs(estimate.relative_height_m - target.relative_height_m)
+        <= height_tolerance
+        and abs(estimate.roll_rad - target.roll_rad)
+        <= WBC_ANGLE_TOLERANCE_RAD
+        and abs(estimate.pitch_rad - target.pitch_rad)
+        <= WBC_ANGLE_TOLERANCE_RAD
+    )
 
 
 class ContactValidityGate:
@@ -1124,6 +1223,73 @@ class KinematicWBC:
         self.dt_s = float(dt_s)
         self.previous_dq = np.zeros(12, dtype=float)
         self.previous_solution: Optional[np.ndarray] = None
+        self._solver = None
+        self._sparse = None
+        self._objective_diagonal = np.asarray(
+            [12.0, 12.0, 80.0, 70.0, 70.0, 12.0] + [3.0] * 12,
+            dtype=float,
+        ) + 1.0e-5
+
+    @staticmethod
+    def _constraint_values(contact_matrix: np.ndarray) -> np.ndarray:
+        """Return fixed-pattern CSC values for [contact; identity]."""
+
+        return np.concatenate(
+            [
+                np.concatenate([contact_matrix[:, column], np.asarray([1.0])])
+                for column in range(18)
+            ]
+        )
+
+    @staticmethod
+    def _constraint_template(sparse, values: np.ndarray):
+        rows = []
+        columns = []
+        for column in range(18):
+            rows.extend(range(12))
+            columns.extend([column] * 12)
+            rows.append(12 + column)
+            columns.append(column)
+        matrix = sparse.csc_matrix(
+            (values, (rows, columns)),
+            shape=(30, 18),
+        )
+        matrix.sort_indices()
+        return matrix
+
+    def prime(self, reference_q: Sequence[float]) -> float:
+        """Allocate and factor the fixed QP workspace before live motion.
+
+        The first OSQP setup can legitimately take longer than one 100 Hz
+        period because it allocates the native workspace and factorization.
+        Priming is therefore an explicit preflight operation; every later
+        ``solve`` still retains the strict end-to-end 10 ms runtime bound.
+        """
+
+        if self._solver is not None:
+            return 0.0
+        q = _vector(reference_q, 12, "reference_q")
+        estimate = TaskSpaceEstimate(
+            relative_height_m=0.0,
+            raw_height_m=0.0,
+            roll_rad=0.0,
+            pitch_rad=0.0,
+            yaw_rad=0.0,
+        )
+        target = WBCTarget(
+            relative_height_m=0.0,
+            roll_rad=0.0,
+            pitch_rad=0.0,
+            yaw_rad=0.0,
+        )
+        result = self.solve(q, q, q, estimate, target)
+        if not result.valid and result.reason != "kinematic WBC solve exceeded 10 ms":
+            raise RuntimeError(
+                "kinematic WBC preflight failed: {}".format(result.reason)
+            )
+        self.previous_dq = np.zeros(12, dtype=float)
+        self.previous_solution = None
+        return result.solve_time_s
 
     def solve(
         self,
@@ -1157,7 +1323,12 @@ class KinematicWBC:
         # Account for matrix assembly and OSQP setup as part of the 100 Hz
         # budget, rather than reporting only the final ADMM call.
         started = time.perf_counter()
-        osqp, sparse = _load_qp_dependencies()
+        if self._solver is None:
+            osqp, sparse = _load_qp_dependencies()
+            self._sparse = sparse
+        else:
+            osqp = None
+            sparse = self._sparse
 
         desired_velocity = np.zeros(18, dtype=float)
         desired_velocity[0] = 0.0
@@ -1196,17 +1367,10 @@ class KinematicWBC:
         )
         desired_velocity[6:] = np.clip(4.0 * (posture - q), -1.0, 1.0)
 
-        weights = np.asarray(
-            [12.0, 12.0, 80.0, 70.0, 70.0, 12.0] + [3.0] * 12,
-            dtype=float,
-        )
-        diagonal = weights + 1.0e-5
-        hessian = sparse.diags(2.0 * diagonal, format="csc")
-        gradient = -2.0 * diagonal * desired_velocity
+        gradient = -2.0 * self._objective_diagonal * desired_velocity
 
         contact_matrix = contact_velocity_matrix(q)
-        identity = np.eye(18)
-        constraints = sparse.csc_matrix(np.vstack([contact_matrix, identity]))
+        constraint_values = self._constraint_values(contact_matrix)
 
         lower_velocity = np.asarray([-0.5] * 3 + [-1.0] * 3 + [-1.0] * 12)
         upper_velocity = -lower_velocity
@@ -1248,46 +1412,59 @@ class KinematicWBC:
 
         lower = np.concatenate([np.zeros(12), lower_velocity])
         upper = np.concatenate([np.zeros(12), upper_velocity])
-        solver = osqp.OSQP()
-        setup_kwargs = dict(
-            P=hessian,
-            q=gradient,
-            A=constraints,
-            l=lower,
-            u=upper,
-            verbose=False,
-            max_iter=WBC_MAX_ITER,
-            eps_abs=WBC_EPS_ABS,
-            eps_rel=WBC_EPS_REL,
-            polishing=False,
-            warm_starting=True,
-        )
-        try:
-            try:
-                solver.setup(**setup_kwargs)
-            except TypeError:
-                setup_kwargs.pop("warm_starting", None)
-                setup_kwargs["warm_start"] = True
-                setup_kwargs.pop("polishing", None)
-                setup_kwargs["polish"] = False
-                solver.setup(**setup_kwargs)
-        except Exception as error:
-            elapsed = time.perf_counter() - started
-            return invalid_result(
-                "setup-exception",
-                "kinematic WBC QP setup raised {}: {}".format(
-                    type(error).__name__, error
-                ),
-                elapsed,
+        if self._solver is None:
+            solver = osqp.OSQP()
+            constraints = self._constraint_template(sparse, constraint_values)
+            hessian = sparse.diags(
+                2.0 * self._objective_diagonal,
+                format="csc",
             )
-        if self.previous_solution is not None:
+            setup_kwargs = dict(
+                P=hessian,
+                q=gradient,
+                A=constraints,
+                l=lower,
+                u=upper,
+                verbose=False,
+                max_iter=WBC_MAX_ITER,
+                eps_abs=WBC_EPS_ABS,
+                eps_rel=WBC_EPS_REL,
+                polishing=False,
+                warm_starting=True,
+            )
             try:
-                solver.warm_start(x=self.previous_solution)
+                try:
+                    solver.setup(**setup_kwargs)
+                except TypeError:
+                    setup_kwargs.pop("warm_starting", None)
+                    setup_kwargs["warm_start"] = True
+                    setup_kwargs.pop("polishing", None)
+                    setup_kwargs["polish"] = False
+                    solver.setup(**setup_kwargs)
             except Exception as error:
                 elapsed = time.perf_counter() - started
                 return invalid_result(
-                    "warm-start-exception",
-                    "kinematic WBC warm start raised {}: {}".format(
+                    "setup-exception",
+                    "kinematic WBC QP setup raised {}: {}".format(
+                        type(error).__name__, error
+                    ),
+                    elapsed,
+                )
+            self._solver = solver
+        else:
+            solver = self._solver
+            try:
+                solver.update(
+                    q=gradient,
+                    l=lower,
+                    u=upper,
+                    Ax=constraint_values,
+                )
+            except Exception as error:
+                elapsed = time.perf_counter() - started
+                return invalid_result(
+                    "update-exception",
+                    "kinematic WBC QP update raised {}: {}".format(
                         type(error).__name__, error
                     ),
                     elapsed,
@@ -1333,7 +1510,15 @@ class KinematicWBC:
                 primal_residual > WBC_MAX_PRIMAL_RESIDUAL
                 or dual_residual > WBC_MAX_DUAL_RESIDUAL
             ):
-                reason = "kinematic WBC residual exceeded the configured bound"
+                reason = (
+                    "kinematic WBC residual exceeded the configured bound "
+                    "(status={!r}, iterations={}, primal={:.3g}, dual={:.3g})"
+                ).format(
+                    status,
+                    iterations,
+                    primal_residual,
+                    dual_residual,
+                )
             contact_vectors = (contact_matrix @ generalized_velocity).reshape(4, 3)
             contact_residual = float(
                 max(np.linalg.norm(contact_vectors[leg]) for leg in range(4))

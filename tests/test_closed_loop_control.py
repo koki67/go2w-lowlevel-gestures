@@ -205,6 +205,74 @@ class LoadedRollEquilibriumGateTests(unittest.TestCase):
         self.assertFalse(status.completed)
         self.assertEqual(status.accumulated_s, 0.0)
 
+    def test_loaded_roll_gate_requires_additional_wbc_conditions(self):
+        target, measured, velocity, torque = self.make_loaded_state()
+        gate = self.make_gate()
+        for _index in range(31):
+            status = gate.update(
+                target,
+                measured,
+                velocity,
+                torque,
+                0.48,
+                0.01,
+                endpoint_reached=True,
+                additional_condition=False,
+            )
+        self.assertFalse(status.completed)
+        self.assertFalse(status.additional_condition_met)
+        self.assertEqual(status.accumulated_s, 0.0)
+
+
+class TaskProgressGovernorTests(unittest.TestCase):
+    def make_governor(self):
+        return control.TaskProgressGovernor(1.0, 8.0)
+
+    def test_support_margin_slows_backs_off_and_requests_return(self):
+        measured = np.zeros(12)
+        governor = self.make_governor()
+        slowed = governor.step(
+            measured,
+            measured,
+            measured,
+            measured,
+            0.01,
+            0.01,
+            task_within_tolerance=False,
+            minimum_normal_load_n=0.08 * control.BODY_WEIGHT_N,
+        )
+        self.assertAlmostEqual(slowed.speed_scale, 0.5)
+        self.assertIsNotNone(slowed.warning)
+
+        governor.progress = 0.5
+        backed_off = governor.step(
+            measured,
+            measured,
+            measured,
+            measured,
+            0.01,
+            0.02,
+            task_within_tolerance=False,
+            minimum_normal_load_n=0.05 * control.BODY_WEIGHT_N,
+        )
+        self.assertLess(governor.progress, 0.5)
+        self.assertEqual(backed_off.speed_scale, 0.0)
+
+        returned = None
+        for index in range(11):
+            returned = governor.step(
+                measured,
+                measured,
+                measured,
+                measured,
+                0.01,
+                0.03 + 0.01 * index,
+                task_within_tolerance=False,
+                minimum_normal_load_n=0.03 * control.BODY_WEIGHT_N,
+            )
+        self.assertTrue(returned.request_return)
+        self.assertIn("wheel load", returned.reason)
+
 
 class KinematicsAndContactTests(unittest.TestCase):
     def test_analytic_leg_jacobians_match_finite_difference(self):
@@ -293,8 +361,8 @@ class KinematicsAndContactTests(unittest.TestCase):
         left = control.task_target_for_gesture("roll", "left", baseline)
         self.assertAlmostEqual(low.relative_height_m, -0.093178)
         self.assertAlmostEqual(high.relative_height_m, 0.076281)
-        self.assertAlmostEqual(right.roll_rad - baseline[0], -0.395469)
-        self.assertAlmostEqual(left.roll_rad - baseline[0], 0.395469)
+        self.assertAlmostEqual(right.roll_rad - baseline[0], -0.35)
+        self.assertAlmostEqual(left.roll_rad - baseline[0], 0.35)
         self.assertEqual(right.pitch_rad, baseline[1])
         self.assertEqual(right.yaw_rad, baseline[2])
 
@@ -306,6 +374,16 @@ class KinematicsAndContactTests(unittest.TestCase):
             hardware.LOW, baseline, forces, baseline_height_m=standard.raw_height_m
         )
         self.assertLess(lowered.relative_height_m, 0.0)
+
+    def test_wbc_roll_has_an_explicit_height_tolerance(self):
+        target = control.WBCTarget(0.0, 0.2, 0.0, 0.0)
+        estimate = control.TaskSpaceEstimate(-0.018, 0.0, 0.18, 0.01, 0.0)
+        self.assertFalse(
+            control.wbc_task_within_tolerance("height", estimate, target)
+        )
+        self.assertTrue(
+            control.wbc_task_within_tolerance("roll", estimate, target)
+        )
 
 
 class KinematicWBCTests(unittest.TestCase):
@@ -331,6 +409,17 @@ class KinematicWBCTests(unittest.TestCase):
         self.assertTrue(np.all(result.q_ref >= control.JOINT_LOWER_RAD))
         self.assertTrue(np.all(result.q_ref <= control.JOINT_UPPER_RAD))
         self.assertTrue(np.all(np.abs(result.q_ref - q) <= control.TRACKING_ENVELOPE_RAD))
+
+    def test_preflight_prime_reuses_one_osqp_workspace(self):
+        q, estimate, target = self.make_problem()
+        solver = control.KinematicWBC()
+        solver.prime(q)
+        workspace = solver._solver
+        first = solver.solve(q, q, q, estimate, target)
+        second = solver.solve(q, first.q_ref, q, estimate, target)
+        self.assertTrue(first.valid, first.reason)
+        self.assertTrue(second.valid, second.reason)
+        self.assertIs(solver._solver, workspace)
 
     def test_conflicting_bounds_fail_closed_before_osqp(self):
         q, estimate, target = self.make_problem()

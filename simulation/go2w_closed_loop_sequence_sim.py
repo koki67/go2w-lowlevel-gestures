@@ -22,6 +22,7 @@ import tempfile
 import time
 
 import go2w_adaptive_plot as adaptive_plot
+import go2w_wbc_plot as wbc_plot
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -127,7 +128,7 @@ def describe(controller_name=None, gesture=None, initial="all") -> None:
     print("  external MJCF/source are read-only; a temporary scene is used")
     print("  ground truth is evaluation-only, never a controller input")
     print("  --viewer: same controller path in a real-time MuJoCo GUI, one initial condition")
-    print("  --save-plot: adaptive joint tracking and governor SVGs (opt-in)")
+    print("  --save-plot: controller-specific diagnostic SVGs (opt-in)")
     print("  output is simulation qualification, not physical qualification")
 
 
@@ -168,11 +169,14 @@ class HeadlessHarness:
     def __init__(
         self,
         initial_condition,
+        gesture=None,
         viewer_enabled=False,
         viewer_speed=1.0,
         record_adaptive_plot=False,
+        record_wbc_plot=False,
     ):
         self.initial_condition = initial_condition
+        self.gesture = gesture
         self._scene_workspace = tempfile.TemporaryDirectory(
             prefix="go2w-closed-loop-mujoco-"
         )
@@ -217,6 +221,27 @@ class HeadlessHarness:
             record_adaptive_plot,
             control.JOINT_NAMES,
             control.TRACKING_ENVELOPE_RAD,
+        )
+        self._wbc_plot_time_origin_s = None
+        self._last_wbc_plot_sample_time_s = None
+        self._wbc_plot_recorder = wbc_plot.WBCPlotRecorder(
+            record_wbc_plot,
+            control.JOINT_NAMES,
+            control.TRACKING_ENVELOPE_RAD,
+            control.TORQUE_LIMIT_NM,
+            body_weight_n=control.BODY_WEIGHT_N,
+            tilt_limit_rad=hardware.RUN_MAX_TILT_RAD,
+            max_commanded_dq_rad_s=control.WBC_MAX_DQ_RAD_S,
+            max_commanded_ddq_rad_s2=control.WBC_MAX_DDQ_RAD_S2,
+            wbc_period_s=control.WBC_PERIOD_S,
+            height_tolerance_m=(
+                control.WBC_ROLL_HEIGHT_TOLERANCE_M
+                if gesture == "roll"
+                else control.WBC_HEIGHT_TOLERANCE_M
+            ),
+            support_slow_ratio=control.WBC_SUPPORT_SLOW_RATIO,
+            support_backoff_ratio=control.WBC_SUPPORT_BACKOFF_RATIO,
+            support_return_ratio=control.WBC_SUPPORT_RETURN_RATIO,
         )
 
     def close(self):
@@ -312,6 +337,8 @@ class HeadlessHarness:
         self.controlled_return_succeeded = False
         self.controlled_return_error = None
         self._adaptive_plot_time_origin_s = float(self.data.time)
+        self._wbc_plot_time_origin_s = float(self.data.time)
+        self._last_wbc_plot_sample_time_s = None
 
     def _record_adaptive_plot_sample(
         self,
@@ -320,31 +347,110 @@ class HeadlessHarness:
         phase_duration_s,
         measured_q,
         decision,
+        measured_dq=None,
+        tau_est=None,
+        body_rpy=None,
     ):
-        if not self._adaptive_plot_recorder.enabled:
+        if (
+            not self._adaptive_plot_recorder.enabled
+            and not self._wbc_plot_recorder.enabled
+        ):
             return
         if self._adaptive_plot_time_origin_s is None:
             raise RuntimeError("adaptive plot time origin was not initialized")
-        self._adaptive_plot_recorder.record(
-            time_s=float(self.data.time) - self._adaptive_plot_time_origin_s,
-            phase=phase,
-            phase_elapsed_s=phase_elapsed_s,
-            phase_duration_s=phase_duration_s,
-            progress=decision.progress,
-            speed_scale=decision.speed_scale,
-            tracking_ratio=decision.tracking_ratio,
-            torque_ratio=decision.torque_ratio,
-            q_ref=decision.q_ref,
-            q_measured=measured_q,
-            event=(
-                decision.reason
-                if decision.emergency or decision.request_return
-                else None
-            ),
-        )
+        if self._adaptive_plot_recorder.enabled:
+            self._adaptive_plot_recorder.record(
+                time_s=float(self.data.time) - self._adaptive_plot_time_origin_s,
+                phase=phase,
+                phase_elapsed_s=phase_elapsed_s,
+                phase_duration_s=phase_duration_s,
+                progress=decision.progress,
+                speed_scale=decision.speed_scale,
+                tracking_ratio=decision.tracking_ratio,
+                torque_ratio=decision.torque_ratio,
+                q_ref=decision.q_ref,
+                q_measured=measured_q,
+                event=(
+                    decision.reason
+                    if decision.emergency or decision.request_return
+                    else None
+                ),
+            )
+        if self._wbc_plot_recorder.enabled:
+            if measured_dq is None or tau_est is None or body_rpy is None:
+                raise RuntimeError("WBC plot state was not supplied")
+            self._record_wbc_plot_sample(
+                phase,
+                decision.q_ref,
+                measured_q,
+                measured_dq,
+                tau_est,
+                body_rpy,
+                progress=decision.progress,
+                speed_scale=decision.speed_scale,
+                event=(
+                    decision.reason
+                    if decision.emergency or decision.request_return
+                    else None
+                ),
+            )
 
     def write_adaptive_plots(self, output_dir, stem):
         return self._adaptive_plot_recorder.write(Path(output_dir), stem)
+
+    def _record_wbc_plot_sample(
+        self,
+        phase,
+        q_ref,
+        q,
+        dq,
+        tau,
+        rpy,
+        *,
+        progress=float("nan"),
+        speed_scale=float("nan"),
+        task_target=None,
+        task_estimate=None,
+        contact=None,
+        qp_result=None,
+        event=None,
+    ):
+        if not self._wbc_plot_recorder.enabled:
+            return
+        if self._wbc_plot_time_origin_s is None:
+            raise RuntimeError("WBC plot time origin was not initialized")
+        relative_time_s = float(self.data.time) - self._wbc_plot_time_origin_s
+        if (
+            event is None
+            and self._last_wbc_plot_sample_time_s is not None
+            and relative_time_s - self._last_wbc_plot_sample_time_s
+            < control.WBC_PERIOD_S - 1.0e-9
+        ):
+            return
+        wheel_positions = control.wheel_positions(q)
+        rotation = control.rpy_rotation(rpy)
+        support_y_m = ((rotation @ wheel_positions.T).T)[:, 1].tolist()
+        self._wbc_plot_recorder.record(
+            time_s=relative_time_s,
+            phase=phase,
+            q_ref=q_ref,
+            q_measured=q,
+            measured_dq=dq,
+            tau_est=tau,
+            body_rpy=rpy,
+            progress=progress,
+            speed_scale=speed_scale,
+            task_target=task_target,
+            task_estimate=task_estimate,
+            contact=contact,
+            qp_result=qp_result,
+            support_y_m=support_y_m,
+            event=event,
+        )
+        self._last_wbc_plot_sample_time_s = relative_time_s
+
+    def write_wbc_plots(self, output_dir, stem):
+        return self._wbc_plot_recorder.write(Path(output_dir), stem)
 
     def state(self):
         sensor = self.data.sensordata
@@ -557,6 +663,9 @@ class HeadlessHarness:
                 duration_s,
                 q,
                 decision,
+                dq,
+                tau,
+                rpy,
             )
             if decision.emergency or decision.request_return:
                 raise SimulationFailure(
@@ -721,6 +830,20 @@ class HeadlessHarness:
                     self.max_contact_balance_ratio,
                     last_contact.balance_residual_ratio,
                 )
+                self._record_wbc_plot_sample(
+                    "contact-validation",
+                    decision.q_ref,
+                    q,
+                    dq,
+                    tau,
+                    rpy,
+                    progress=decision.progress,
+                    speed_scale=decision.speed_scale,
+                    contact=last_contact,
+                    event=(
+                        last_contact.reason if not last_contact.valid else None
+                    ),
+                )
                 if gate.update(last_contact.valid, control.WBC_PERIOD_S):
                     raw = control.estimate_task_space(
                         q, rpy, last_contact.forces, baseline_height_m=0.0
@@ -731,12 +854,11 @@ class HeadlessHarness:
         reason = last_contact.reason if last_contact is not None else "no estimate"
         raise SimulationFailure("contact validity gate failed: {}".format(reason))
 
-    @staticmethod
-    def task_in_tolerance(estimate, target):
-        return (
-            abs(estimate.relative_height_m - target.relative_height_m) <= 0.015
-            and abs(estimate.roll_rad - target.roll_rad) <= math.radians(2.0)
-            and abs(estimate.pitch_rad - target.pitch_rad) <= math.radians(2.0)
+    def task_in_tolerance(self, estimate, target):
+        return control.wbc_task_within_tolerance(
+            self.gesture,
+            estimate,
+            target,
         )
 
     def wbc_phase(
@@ -751,6 +873,9 @@ class HeadlessHarness:
         timeout_s,
         baseline_height,
         solver,
+        *,
+        loaded_roll_expected_sign=None,
+        loaded_roll_baseline_rad=None,
     ):
         self.set_phase("WBC {}".format(name))
         governor = control.TaskProgressGovernor(duration_s, timeout_s)
@@ -760,6 +885,16 @@ class HeadlessHarness:
         invalid_contact_s = 0.0
         last_estimate = None
         last_qp = None
+        loaded_roll_gate = None
+        if loaded_roll_expected_sign is not None:
+            if loaded_roll_baseline_rad is None:
+                raise ValueError("loaded roll completion requires a baseline")
+            loaded_roll_gate = control.LoadedRollEquilibriumGate(
+                loaded_roll_baseline_rad,
+                loaded_roll_expected_sign,
+                hardware.KP,
+                hardware.KD,
+            )
         while True:
             q, dq, tau, rpy = self.check_runtime_state(q_ref, self.phase)
             if tick % 5 == 0:
@@ -771,6 +906,17 @@ class HeadlessHarness:
                 invalid_contact_s = (
                     0.0 if contact.valid else invalid_contact_s + control.WBC_PERIOD_S
                 )
+                if not contact.valid:
+                    self._record_wbc_plot_sample(
+                        name,
+                        q_ref,
+                        q,
+                        dq,
+                        tau,
+                        rpy,
+                        contact=contact,
+                        event=contact.reason,
+                    )
                 if invalid_contact_s >= 0.10:
                     raise SimulationFailure(
                         "{} contact invalid: {}".format(name, contact.reason)
@@ -779,6 +925,9 @@ class HeadlessHarness:
                     estimate = control.estimate_task_space(
                         q, rpy, contact.forces, baseline_height_m=baseline_height
                     )
+                    task_within_tolerance = self.task_in_tolerance(
+                        estimate, task_target
+                    )
                     decision = governor.step(
                         q_ref,
                         q,
@@ -786,20 +935,33 @@ class HeadlessHarness:
                         tau,
                         control.WBC_PERIOD_S,
                         elapsed,
-                        task_within_tolerance=self.task_in_tolerance(
-                            estimate, task_target
-                        ),
+                        task_within_tolerance=task_within_tolerance,
+                        minimum_normal_load_n=contact.minimum_normal_load_n,
                     )
-                    if decision.emergency or decision.request_return:
-                        raise SimulationFailure(
-                            "{} governor: {}".format(name, decision.reason)
-                        )
                     desired_task = control.interpolate_task_target(
                         task_source, task_target, decision.progress
                     )
                     desired_posture = control.smooth_path(
                         posture_source, posture_target, decision.progress
                     )
+                    if decision.emergency or decision.request_return:
+                        self._record_wbc_plot_sample(
+                            name,
+                            q_ref,
+                            q,
+                            dq,
+                            tau,
+                            rpy,
+                            progress=decision.progress,
+                            speed_scale=decision.speed_scale,
+                            task_target=desired_task,
+                            task_estimate=estimate,
+                            contact=contact,
+                            event=decision.reason,
+                        )
+                        raise SimulationFailure(
+                            "{} governor: {}".format(name, decision.reason)
+                        )
                     qp = solver.solve(
                         q,
                         q_ref,
@@ -809,10 +971,58 @@ class HeadlessHarness:
                         self.imu_gyro(),
                     )
                     if not qp.valid:
+                        self._record_wbc_plot_sample(
+                            name,
+                            q_ref,
+                            q,
+                            dq,
+                            tau,
+                            rpy,
+                            progress=decision.progress,
+                            speed_scale=decision.speed_scale,
+                            task_target=desired_task,
+                            task_estimate=estimate,
+                            contact=contact,
+                            qp_result=qp,
+                            event=qp.reason,
+                        )
                         raise SimulationFailure(
                             "{} QP: {}".format(name, qp.reason)
                         )
                     q_ref = qp.q_ref.copy()
+                    phase_completed = decision.completed
+                    loaded_status = None
+                    if loaded_roll_gate is not None:
+                        loaded_status = loaded_roll_gate.update(
+                            q_ref,
+                            q,
+                            dq,
+                            tau,
+                            rpy[0],
+                            control.WBC_PERIOD_S,
+                            endpoint_reached=decision.progress >= 1.0,
+                            additional_condition=(
+                                task_within_tolerance
+                                and contact.minimum_normal_load_n
+                                >= control.WBC_SUPPORT_COMPLETION_RATIO
+                                * control.BODY_WEIGHT_N
+                            ),
+                        )
+                        phase_completed = loaded_status.completed
+                    self._record_wbc_plot_sample(
+                        name,
+                        q_ref,
+                        q,
+                        dq,
+                        tau,
+                        rpy,
+                        progress=decision.progress,
+                        speed_scale=decision.speed_scale,
+                        task_target=desired_task,
+                        task_estimate=estimate,
+                        contact=contact,
+                        qp_result=qp,
+                    )
                     self.qp_solve_times.append(qp.solve_time_s)
                     self.max_contact_velocity_residual_m_s = max(
                         self.max_contact_velocity_residual_m_s,
@@ -820,12 +1030,17 @@ class HeadlessHarness:
                     )
                     last_estimate = estimate
                     last_qp = qp
-                    if decision.completed:
+                    if phase_completed:
                         self.phase_records.append(
                             {
                                 "phase": name,
                                 "elapsed_s": elapsed,
                                 "progress": decision.progress,
+                                "completion_gate": (
+                                    "loaded-roll"
+                                    if loaded_status is not None
+                                    else "default-50-percent"
+                                ),
                                 "height_error_m": (
                                     estimate.relative_height_m
                                     - task_target.relative_height_m
@@ -872,12 +1087,24 @@ class HeadlessHarness:
         posture_source = np.asarray(hardware.STANDARD, dtype=float)
         task_source = standard_task
         if gesture == "height":
-            sides = (("low", hardware.LOW), ("high", hardware.HIGH))
+            sides = (
+                ("low", hardware.LOW, None),
+                ("high", hardware.HIGH, None),
+            )
+            transition_timeout_s = control.FAST_TRANSITION_TIMEOUT_S
         else:
-            sides = (("right", hardware.ROLL_RIGHT), ("left", hardware.ROLL_LEFT))
+            # The scripted roll poses are time-driven joint-space endpoints.
+            # Reusing them as a WBC posture objective unloads the inside wheels;
+            # let the task/contact kinematics generate the roll posture instead.
+            sides = (
+                ("right", hardware.STANDARD, -1.0),
+                ("left", hardware.STANDARD, 1.0),
+            )
+            transition_timeout_s = control.WBC_ROLL_TRANSITION_TIMEOUT_S
         solver = control.KinematicWBC()
+        solver.prime(hardware.STANDARD)
         for cycle in range(1, 4):
-            for side, posture_target in sides:
+            for side, posture_target, loaded_roll_expected_sign in sides:
                 task_target = control.task_target_for_gesture(
                     gesture, side, baseline_rpy
                 )
@@ -889,9 +1116,11 @@ class HeadlessHarness:
                     task_source,
                     task_target,
                     1.0,
-                    control.FAST_TRANSITION_TIMEOUT_S,
+                    transition_timeout_s,
                     baseline_height,
                     solver,
+                    loaded_roll_expected_sign=loaded_roll_expected_sign,
+                    loaded_roll_baseline_rad=standard_task.roll_rad,
                 )
                 current = self.wbc_phase(
                     "hold-{}-{}".format(cycle, side),
@@ -904,24 +1133,42 @@ class HeadlessHarness:
                     0.5 + control.HOLD_CONVERGENCE_TIMEOUT_S,
                     baseline_height,
                     solver,
+                    loaded_roll_expected_sign=loaded_roll_expected_sign,
+                    loaded_roll_baseline_rad=standard_task.roll_rad,
                 )
                 posture_source = np.asarray(posture_target, dtype=float)
                 task_source = task_target
             self.cycles_completed = cycle
-        current = self.adaptive_phase(
-            "adaptive-standard-after-wbc",
-            self.state()[0],
+        current = self.wbc_phase(
+            "transition-final-standard",
+            current,
+            posture_source,
             hardware.STANDARD,
-            hardware.STANDARD_TRANSITION_S,
-            control.STARTUP_TIMEOUT_S,
+            task_source,
+            standard_task,
+            1.0,
+            control.WBC_STANDARD_RETURN_TIMEOUT_S,
+            baseline_height,
+            solver,
         )
-        current = self.adaptive_phase(
-            "hold-return-standard",
+        current = self.wbc_phase(
+            "settle-final-standard",
             current,
-            current,
-            hardware.STANDARD_HOLD_S,
-            hardware.STANDARD_HOLD_S + control.HOLD_CONVERGENCE_TIMEOUT_S,
+            hardware.STANDARD,
+            hardware.STANDARD,
+            standard_task,
+            standard_task,
+            0.5,
+            0.5 + control.HOLD_CONVERGENCE_TIMEOUT_S,
+            baseline_height,
+            solver,
         )
+        # The WBC phases above already returned to and settled the standard
+        # task.  Starting a second joint-space STANDARD transition here can
+        # fight the load-bearing WBC equilibrium and needlessly fail its
+        # stricter generic tracking gate.  Hand the measured settled pose
+        # directly to the existing adaptive prone return instead.
+        current = self.state()[0].copy()
         current = self.adaptive_phase(
             "return-captured-prone",
             current,
@@ -948,8 +1195,15 @@ class HeadlessHarness:
             float(np.percentile(self.qp_solve_times, 99)) if self.qp_solve_times else None
         )
         return_error = float(np.max(np.abs(final_q - captured_prone)))
+        height_tolerance_m = 0.015
+        if controller_name == "wbc":
+            height_tolerance_m = (
+                control.WBC_ROLL_HEIGHT_TOLERANCE_M
+                if gesture == "roll"
+                else control.WBC_HEIGHT_TOLERANCE_M
+            )
         hold_ok = all(
-            abs(item["height_error_m"]) <= 0.015
+            abs(item["height_error_m"]) <= height_tolerance_m
             and abs(item["roll_error_rad"]) <= math.radians(2.0)
             and abs(item["pitch_error_rad"]) <= math.radians(2.0)
             for item in self.hold_endpoints
@@ -1028,9 +1282,11 @@ def run_case(
 ):
     harness = HeadlessHarness(
         initial_condition,
+        gesture=gesture,
         viewer_enabled=viewer_enabled,
         viewer_speed=viewer_speed,
-        record_adaptive_plot=save_plot,
+        record_adaptive_plot=save_plot and controller_name == "adaptive",
+        record_wbc_plot=save_plot and controller_name == "wbc",
     )
     captured = None
     error = None
@@ -1039,6 +1295,10 @@ def run_case(
         "sample_count": 0,
         "joint_tracking_svg": None,
         "adaptive_governor_svg": None,
+        "wbc_task_tracking_svg": None,
+        "wbc_contact_support_svg": None,
+        "wbc_contact_qp_health_svg": None,
+        "wbc_solver_safety_svg": None,
         "generation_error": None,
     }
     try:
@@ -1085,9 +1345,15 @@ def run_case(
             try:
                 if plot_output_dir is None or plot_stem is None:
                     raise RuntimeError("plot output directory and stem are required")
-                plot_artifacts.update(
-                    harness.write_adaptive_plots(plot_output_dir, plot_stem)
-                )
+                if controller_name == "adaptive":
+                    generated = harness.write_adaptive_plots(
+                        plot_output_dir, plot_stem
+                    )
+                else:
+                    generated = harness.write_wbc_plots(
+                        plot_output_dir, plot_stem
+                    )
+                plot_artifacts.update(generated)
             except Exception as plot_error:
                 plot_artifacts["generation_error"] = "{}: {}".format(
                     type(plot_error).__name__, plot_error
@@ -1129,7 +1395,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--save-plot",
         action="store_true",
-        help="save adaptive joint-tracking and reference-governor SVGs after the run",
+        help="save controller-specific diagnostic SVGs after the run",
     )
     parser.add_argument("--describe", action="store_true")
     parser.add_argument("--doctor", action="store_true")
@@ -1143,8 +1409,6 @@ def argument_error(args):
         return "--viewer-hold requires --viewer"
     if not math.isfinite(args.viewer_speed) or args.viewer_speed <= 0.0:
         return "--viewer-speed must be a positive finite number"
-    if args.save_plot and args.controller != "adaptive":
-        return "--save-plot currently requires --controller adaptive"
     return None
 
 
@@ -1222,18 +1486,31 @@ def main(argv=None):
                     flush=True,
                 )
             else:
-                print(
-                    "adaptive joint plot: {}".format(
-                        artifacts["joint_tracking_svg"]
-                    ),
-                    flush=True,
-                )
-                print(
-                    "adaptive governor plot: {}".format(
-                        artifacts["adaptive_governor_svg"]
-                    ),
-                    flush=True,
-                )
+                if args.controller == "adaptive":
+                    print(
+                        "adaptive joint plot: {}".format(
+                            artifacts["joint_tracking_svg"]
+                        ),
+                        flush=True,
+                    )
+                    print(
+                        "adaptive governor plot: {}".format(
+                            artifacts["adaptive_governor_svg"]
+                        ),
+                        flush=True,
+                    )
+                else:
+                    for label, key in (
+                        ("WBC joint plot", "joint_tracking_svg"),
+                        ("WBC task plot", "wbc_task_tracking_svg"),
+                        ("WBC support plot", "wbc_contact_support_svg"),
+                        ("WBC contact-QP plot", "wbc_contact_qp_health_svg"),
+                        ("WBC solver/safety plot", "wbc_solver_safety_svg"),
+                    ):
+                        print(
+                            "{}: {}".format(label, artifacts[key]),
+                            flush=True,
+                        )
 
     output_path = output_dir / "{}_{}_{}{}_qualification.summary.json".format(
         timestamp, args.controller, args.gesture, mode_suffix

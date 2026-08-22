@@ -34,6 +34,9 @@ class AdaptivePlotRecorder:
         enabled: bool,
         joint_names: Sequence[str],
         tracking_envelopes: Sequence[float],
+        *,
+        controller_label: str = "adaptive",
+        companion_plot_label: str = "the governor plot",
     ) -> None:
         self.enabled = bool(enabled)
         self.joint_names = tuple(str(name) for name in joint_names)
@@ -44,6 +47,8 @@ class AdaptivePlotRecorder:
             raise ValueError("adaptive plots require 12 joint names and envelopes")
         if any(value <= 0.0 for value in self.tracking_envelopes):
             raise ValueError("tracking envelopes must be positive")
+        self.controller_label = str(controller_label)
+        self.companion_plot_label = str(companion_plot_label)
         self.samples: list[AdaptivePlotSample] = []
 
     def record(
@@ -374,13 +379,17 @@ class AdaptivePlotRecorder:
             '<style>text { font-family: sans-serif; fill: #222; }</style>',
             '<text x="800" y="28" text-anchor="middle" font-size="20" '
             'font-weight="bold">{}</text>'.format(
-                escape(stem + " adaptive joint tracking")
+                escape(stem + " {} joint tracking".format(self.controller_label))
             ),
             '<text x="800" y="50" text-anchor="middle" font-size="13">'
-            'adaptive q reference vs MuJoCo measured q; phase bands are shared '
-            'with the governor plot</text>',
+            '{} q reference vs MuJoCo measured q; phase bands are shared '
+            'with {}</text>'.format(
+                escape(self.controller_label),
+                escape(self.companion_plot_label),
+            ),
             '<line x1="1180" y1="72" x2="1225" y2="72" stroke="#d62728" '
-            'stroke-width="2" /><text x="1232" y="76" font-size="12">adaptive target</text>',
+            'stroke-width="2" /><text x="1232" y="76" font-size="12">'
+            '{} target</text>'.format(escape(self.controller_label)),
             '<line x1="1370" y1="72" x2="1415" y2="72" stroke="#1f77b4" '
             'stroke-width="2" /><text x="1422" y="76" font-size="12">measured</text>',
         ]

@@ -9,7 +9,6 @@ is not a direct-torque dynamic WBC.
 
 from __future__ import print_function
 
-import math
 import queue
 from types import SimpleNamespace
 import sys
@@ -41,15 +40,19 @@ def print_wbc_plan(gesture=None, timing=base.FAST_TIMING):
         "  height targets relative to STANDARD: low -0.093178 m, high +0.076281 m"
     )
     print(
-        "  roll targets relative to STANDARD: right -0.395469 rad, "
-        "left +0.395469 rad"
+        "  roll targets relative to STANDARD: right -0.35 rad, left +0.35 rad"
     )
     print("  pitch stays at the STANDARD reference; x/y/yaw are held")
+    print("  roll posture regularization stays near STANDARD; scripted roll poses are unused")
     print(
         "  contact forces use actuator/gravity equilibrium and J(q)^T f; "
         "foot_force is unused"
     )
     print("  requires 0.5 s continuously valid four-wheel load estimation")
+    print(
+        "  minimum estimated wheel load: slow below 10%, back off below 6%, "
+        "return below 4% of body weight"
+    )
     print("  hardware requires: {}".format(SUPPORT_CONFIRMATION))
     print("  this is not a direct-torque dynamic WBC")
 
@@ -70,13 +73,11 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
         self._wbc_solver = closed_loop.KinematicWBC()
         self._last_wbc_extra = {}
 
-    @staticmethod
-    def _task_is_within_tolerance(estimate, target):
-        angular_tolerance = math.radians(2.0)
-        return (
-            abs(estimate.relative_height_m - target.relative_height_m) <= 0.015
-            and abs(estimate.roll_rad - target.roll_rad) <= angular_tolerance
-            and abs(estimate.pitch_rad - target.pitch_rad) <= angular_tolerance
+    def _task_is_within_tolerance(self, estimate, target):
+        return closed_loop.wbc_task_within_tolerance(
+            self.gesture,
+            estimate,
+            target,
         )
 
     @staticmethod
@@ -151,6 +152,13 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
     def _validate_preflight_state(self):
         super()._validate_preflight_state()
         closed_loop._load_qp_dependencies()
+        prime_s = self._wbc_solver.prime(base.STANDARD)
+        print(
+            "WBC OSQP workspace primed in {:.3f} ms before live motion".format(
+                1000.0 * prime_s
+            ),
+            flush=True,
+        )
 
     def _estimate_task(self, sample, contact):
         if self._baseline_height_m is None:
@@ -416,6 +424,9 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
         task_target,
         duration_s,
         timeout_s,
+        *,
+        loaded_roll_expected_sign=None,
+        loaded_roll_baseline_rad=None,
     ):
         phase = "WBC {}".format(name)
         print(
@@ -432,6 +443,16 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
         last_decision = None
         last_extra = dict(self._last_wbc_extra)
         invalid_contact_s = 0.0
+        loaded_roll_gate = None
+        if loaded_roll_expected_sign is not None:
+            if loaded_roll_baseline_rad is None:
+                raise ValueError("loaded roll completion requires a baseline")
+            loaded_roll_gate = closed_loop.LoadedRollEquilibriumGate(
+                loaded_roll_baseline_rad,
+                loaded_roll_expected_sign,
+                base.KP,
+                base.KD,
+            )
         while True:
             elapsed = time.monotonic() - start
             sample = super(adaptive.AdaptiveGestureController, self)._check_runtime(
@@ -470,6 +491,7 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
                         closed_loop.WBC_PERIOD_S,
                         elapsed,
                         task_within_tolerance=final_tolerance,
+                        minimum_normal_load_n=contact.minimum_normal_load_n,
                     )
                     if decision.emergency:
                         raise RuntimeError(decision.reason or "WBC governor emergency")
@@ -507,6 +529,25 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
                             "WBC QP failed closed: {}".format(qp_result.reason)
                         )
                     q_ref = qp_result.q_ref.copy()
+                    phase_completed = decision.completed
+                    loaded_status = None
+                    if loaded_roll_gate is not None:
+                        loaded_status = loaded_roll_gate.update(
+                            q_ref,
+                            sample.pose,
+                            sample.leg_velocity,
+                            sample.tau_est[:12],
+                            sample.rpy[0],
+                            closed_loop.WBC_PERIOD_S,
+                            endpoint_reached=decision.progress >= 1.0,
+                            additional_condition=(
+                                final_tolerance
+                                and contact.minimum_normal_load_n
+                                >= closed_loop.WBC_SUPPORT_COMPLETION_RATIO
+                                * closed_loop.BODY_WEIGHT_N
+                            ),
+                        )
+                        phase_completed = loaded_status.completed
                     last_decision = decision
                     last_extra = self._contact_extra(contact)
                     last_extra.update(
@@ -520,7 +561,7 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
                             flush=True,
                         )
                         self._last_governor_warning = decision.warning
-                    if decision.completed:
+                    if phase_completed:
                         self._write_pose(q_ref.tolist())
                         self._record_wbc_tick(
                             sample,
@@ -575,22 +616,24 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
         posture_source = np.asarray(base.STANDARD, dtype=float)
         if self.gesture == "height":
             side_specs = (
-                ("low", base.LOW),
-                ("high", base.HIGH),
+                ("low", base.LOW, None),
+                ("high", base.HIGH, None),
             )
             cycles = base.HEIGHT_CYCLES
+            transition_timeout_s = closed_loop.FAST_TRANSITION_TIMEOUT_S
         elif self.gesture == "roll":
             side_specs = (
-                ("right", base.ROLL_RIGHT),
-                ("left", base.ROLL_LEFT),
+                ("right", base.STANDARD, -1.0),
+                ("left", base.STANDARD, 1.0),
             )
             cycles = base.ROLL_CYCLES
+            transition_timeout_s = closed_loop.WBC_ROLL_TRANSITION_TIMEOUT_S
         else:
             raise RuntimeError("unsupported WBC gesture: {!r}".format(self.gesture))
 
         for cycle in range(1, cycles + 1):
             print("WBC {} cycle {}/{}".format(self.gesture, cycle, cycles), flush=True)
-            for side, posture_target in side_specs:
+            for side, posture_target, loaded_roll_expected_sign in side_specs:
                 task_target = closed_loop.task_target_for_gesture(
                     self.gesture, side, self._baseline_rpy
                 )
@@ -602,7 +645,9 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
                     task_source,
                     task_target,
                     self.timing.transition_s,
-                    closed_loop.FAST_TRANSITION_TIMEOUT_S,
+                    transition_timeout_s,
+                    loaded_roll_expected_sign=loaded_roll_expected_sign,
+                    loaded_roll_baseline_rad=standard_task.roll_rad,
                 )
                 current_q_ref = self._run_wbc_phase(
                     "hold {}".format(side),
@@ -613,20 +658,37 @@ class WBCGestureController(adaptive.AdaptiveGestureController):
                     task_target,
                     self.timing.hold_s,
                     self.timing.hold_s + closed_loop.HOLD_CONVERGENCE_TIMEOUT_S,
+                    loaded_roll_expected_sign=loaded_roll_expected_sign,
+                    loaded_roll_baseline_rad=standard_task.roll_rad,
                 )
                 posture_source = np.asarray(posture_target, dtype=float)
                 task_source = task_target
 
-        sample = self._latest_sample()
-        current_pose = self._adaptive_transition(
-            "standard after WBC",
-            sample.pose,
+        current_q_ref = self._run_wbc_phase(
+            "transition -> final standard",
+            current_q_ref,
+            posture_source,
             base.STANDARD,
-            base.STANDARD_TRANSITION_S,
-            closed_loop.STARTUP_TIMEOUT_S,
+            task_source,
+            standard_task,
+            self.timing.transition_s,
+            closed_loop.WBC_STANDARD_RETURN_TIMEOUT_S,
         )
-        self._adaptive_hold("standard", base.STANDARD, base.STANDARD_HOLD_S)
-        self._finish_adaptive_at_prone(current_pose)
+        current_q_ref = self._run_wbc_phase(
+            "settle final standard",
+            current_q_ref,
+            base.STANDARD,
+            base.STANDARD,
+            standard_task,
+            standard_task,
+            self.timing.hold_s,
+            self.timing.hold_s + closed_loop.HOLD_CONVERGENCE_TIMEOUT_S,
+        )
+        # The final WBC phases already settle the standard task.  Avoid a
+        # redundant joint-space STANDARD transition that can fight the
+        # load-bearing equilibrium; hand the measured pose directly to the
+        # established adaptive prone return.
+        self._finish_adaptive_at_prone(self._latest_sample().pose)
 
     def _run_selected_gesture(self):
         self._run_wbc_sequence()
