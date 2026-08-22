@@ -37,6 +37,11 @@ def print_adaptive_plan(gesture=None, timing=base.FAST_TIMING):
     print(
         "  completion gate: <=50% envelope and max |dq| <=0.20 rad/s for 0.30 s"
     )
+    if gesture in (None, "roll"):
+        print(
+            "  loaded roll completion: <=70% envelope, PD/tau_est equilibrium, "
+            "max |dq| <=0.02 rad/s, torque <60%, intended IMU direction for 0.30 s"
+        )
     print("  wall timeouts: fast 8 s, startup 12 s, prone return 15 s")
     print(
         "  provisional tau_est policy: warn 60%, stop progress 75%, "
@@ -235,6 +240,16 @@ class ClosedLoopTelemetryRecorder:
             status = str(row.get("wbc_qp_status", "")).strip()
             if status:
                 qp_status_counts[status] = qp_status_counts.get(status, 0) + 1
+        loaded_roll_rows = [
+            row
+            for row in self.rows
+            if row.get("completion_gate") == "loaded-roll-static-pd"
+        ]
+        loaded_roll_completed_rows = [
+            row
+            for row in loaded_roll_rows
+            if bool(row.get("loaded_roll_gate_completed", False))
+        ]
         summary = {
             "schema_version": 1,
             "created_at": self.created_at.isoformat(),
@@ -260,6 +275,45 @@ class ClosedLoopTelemetryRecorder:
             "temperature_raw_by_motor": temperature_ranges,
             "power_v": range_summary("power_v"),
             "power_a": range_summary("power_a"),
+            "adaptive_roll_equilibrium": {
+                "active": bool(loaded_roll_rows),
+                "completion_sample_count": len(loaded_roll_completed_rows),
+                "max_raw_tracking_ratio": max(
+                    finite_values("loaded_roll_raw_tracking_ratio"),
+                    default=None,
+                ),
+                "max_pd_residual_ratio": max(
+                    finite_values("loaded_roll_pd_residual_ratio"),
+                    default=None,
+                ),
+                "max_abs_dq_rad_s": max(
+                    finite_values("loaded_roll_max_abs_dq_rad_s"),
+                    default=None,
+                ),
+                "max_signed_body_roll_rad": max(
+                    finite_values("loaded_roll_signed_body_roll_rad"),
+                    default=None,
+                ),
+                "thresholds": {
+                    "raw_tracking_ratio": (
+                        closed_loop.LOADED_ROLL_COMPLETION_RATIO
+                    ),
+                    "pd_residual_ratio": (
+                        closed_loop.LOADED_ROLL_PD_RESIDUAL_RATIO
+                    ),
+                    "max_abs_dq_rad_s": (
+                        closed_loop.LOADED_ROLL_MAX_DQ_RAD_S
+                    ),
+                    "minimum_signed_body_roll_rad": (
+                        closed_loop.LOADED_ROLL_MIN_SIGNED_BODY_ROLL_RAD
+                    ),
+                    "maximum_torque_ratio_exclusive": (
+                        closed_loop.TORQUE_WARN_RATIO
+                    ),
+                    "dwell_s": closed_loop.CONVERGENCE_DWELL_S,
+                },
+                "physically_qualified": False,
+            },
             "wbc": {
                 "qp_solve_count": len(qp_solve_times),
                 "qp_solve_p99_s": (
@@ -463,6 +517,8 @@ class AdaptiveGestureController(base.HardwareGestureController):
         *,
         ignore_first_stop=False,
         return_mode=False,
+        loaded_roll_baseline_rad=None,
+        loaded_roll_expected_sign=None,
     ):
         governor = closed_loop.ReferenceGovernor(
             source,
@@ -470,6 +526,25 @@ class AdaptiveGestureController(base.HardwareGestureController):
             duration_s=duration_s,
             timeout_s=timeout_s,
         )
+        loaded_roll_requested = (
+            loaded_roll_baseline_rad is not None
+            or loaded_roll_expected_sign is not None
+        )
+        if loaded_roll_requested and (
+            loaded_roll_baseline_rad is None
+            or loaded_roll_expected_sign is None
+        ):
+            raise ValueError(
+                "loaded roll completion requires both baseline and expected sign"
+            )
+        loaded_roll_gate = None
+        if loaded_roll_requested:
+            loaded_roll_gate = closed_loop.LoadedRollEquilibriumGate(
+                loaded_roll_baseline_rad,
+                loaded_roll_expected_sign,
+                base.KP,
+                base.KD,
+            )
         start = time.monotonic()
         previous_step = start
         next_tick = start
@@ -497,7 +572,53 @@ class AdaptiveGestureController(base.HardwareGestureController):
                 return_mode=return_mode,
             )
             event = decision.reason or decision.warning or ""
-            self._record_closed_loop(sample, decision, phase, elapsed, event=event)
+            phase_completed = decision.completed
+            extra = None
+            if loaded_roll_gate is not None:
+                loaded_status = loaded_roll_gate.update(
+                    decision.q_ref,
+                    sample.pose,
+                    sample.leg_velocity,
+                    sample.tau_est[:12],
+                    sample.rpy[0],
+                    dt_s,
+                    endpoint_reached=decision.progress >= 1.0,
+                )
+                phase_completed = loaded_status.completed
+                extra = {
+                    "completion_gate": "loaded-roll-static-pd",
+                    "loaded_roll_gate_completed": loaded_status.completed,
+                    "loaded_roll_gate_dwell_s": loaded_status.accumulated_s,
+                    "loaded_roll_raw_tracking_ratio": (
+                        loaded_status.raw_tracking_ratio
+                    ),
+                    "loaded_roll_pd_residual_ratio": (
+                        loaded_status.pd_residual_ratio
+                    ),
+                    "loaded_roll_signed_body_roll_rad": (
+                        loaded_status.signed_body_roll_rad
+                    ),
+                    "loaded_roll_max_abs_dq_rad_s": (
+                        loaded_status.max_abs_dq_rad_s
+                    ),
+                    "loaded_roll_joint_bound_met": loaded_status.joint_bound_met,
+                    "loaded_roll_pd_balance_met": loaded_status.pd_balance_met,
+                    "loaded_roll_low_velocity_met": loaded_status.low_velocity_met,
+                    "loaded_roll_torque_margin_met": (
+                        loaded_status.torque_margin_met
+                    ),
+                    "loaded_roll_direction_met": loaded_status.roll_direction_met,
+                }
+                if phase_completed and not event:
+                    event = "loaded roll static-PD equilibrium confirmed"
+            self._record_closed_loop(
+                sample,
+                decision,
+                phase,
+                elapsed,
+                event=event,
+                extra=extra,
+            )
             if decision.warning and decision.warning != self._last_governor_warning:
                 print("WARNING: {}".format(decision.warning), file=sys.stderr, flush=True)
                 self._last_governor_warning = decision.warning
@@ -509,7 +630,7 @@ class AdaptiveGestureController(base.HardwareGestureController):
                 )
             last_pose = decision.q_ref.tolist()
             self._write_pose(last_pose)
-            if decision.completed:
+            if phase_completed:
                 return last_pose
 
             next_tick += base.CONTROL_PERIOD_S
@@ -533,6 +654,8 @@ class AdaptiveGestureController(base.HardwareGestureController):
         *,
         ignore_first_stop=False,
         return_mode=False,
+        loaded_roll_baseline_rad=None,
+        loaded_roll_expected_sign=None,
     ):
         phase = "adaptive transition -> {}".format(name)
         print(
@@ -549,6 +672,8 @@ class AdaptiveGestureController(base.HardwareGestureController):
             timeout_s,
             ignore_first_stop=ignore_first_stop,
             return_mode=return_mode,
+            loaded_roll_baseline_rad=loaded_roll_baseline_rad,
+            loaded_roll_expected_sign=loaded_roll_expected_sign,
         )
 
     def _adaptive_hold(
@@ -559,6 +684,8 @@ class AdaptiveGestureController(base.HardwareGestureController):
         *,
         ignore_first_stop=False,
         return_mode=False,
+        loaded_roll_baseline_rad=None,
+        loaded_roll_expected_sign=None,
     ):
         phase = "adaptive hold {}".format(name)
         timeout_s = minimum_s + closed_loop.HOLD_CONVERGENCE_TIMEOUT_S
@@ -576,6 +703,8 @@ class AdaptiveGestureController(base.HardwareGestureController):
             timeout_s,
             ignore_first_stop=ignore_first_stop,
             return_mode=return_mode,
+            loaded_roll_baseline_rad=loaded_roll_baseline_rad,
+            loaded_roll_expected_sign=loaded_roll_expected_sign,
         )
 
     def _run_height_sequence(self):
@@ -630,6 +759,11 @@ class AdaptiveGestureController(base.HardwareGestureController):
             closed_loop.STARTUP_TIMEOUT_S,
         )
         self._adaptive_hold("standard", base.STANDARD, base.STANDARD_HOLD_S)
+        standard_sample = self._latest_sample()
+        if standard_sample is None:
+            raise RuntimeError("extended LowState missing after STANDARD hold")
+        self._check_extended_runtime(standard_sample)
+        standard_roll_rad = float(standard_sample.rpy[0])
         for cycle in range(1, base.ROLL_CYCLES + 1):
             print("adaptive roll cycle {}/{}".format(cycle, base.ROLL_CYCLES))
             current_pose = self._adaptive_transition(
@@ -638,16 +772,32 @@ class AdaptiveGestureController(base.HardwareGestureController):
                 base.ROLL_RIGHT,
                 self.timing.transition_s,
                 closed_loop.FAST_TRANSITION_TIMEOUT_S,
+                loaded_roll_baseline_rad=standard_roll_rad,
+                loaded_roll_expected_sign=closed_loop.ADAPTIVE_ROLL_RIGHT_IMU_SIGN,
             )
-            self._adaptive_hold("right roll", base.ROLL_RIGHT, self.timing.hold_s)
+            self._adaptive_hold(
+                "right roll",
+                base.ROLL_RIGHT,
+                self.timing.hold_s,
+                loaded_roll_baseline_rad=standard_roll_rad,
+                loaded_roll_expected_sign=closed_loop.ADAPTIVE_ROLL_RIGHT_IMU_SIGN,
+            )
             current_pose = self._adaptive_transition(
                 "left roll",
                 current_pose,
                 base.ROLL_LEFT,
                 self.timing.transition_s,
                 closed_loop.FAST_TRANSITION_TIMEOUT_S,
+                loaded_roll_baseline_rad=standard_roll_rad,
+                loaded_roll_expected_sign=closed_loop.ADAPTIVE_ROLL_LEFT_IMU_SIGN,
             )
-            self._adaptive_hold("left roll", base.ROLL_LEFT, self.timing.hold_s)
+            self._adaptive_hold(
+                "left roll",
+                base.ROLL_LEFT,
+                self.timing.hold_s,
+                loaded_roll_baseline_rad=standard_roll_rad,
+                loaded_roll_expected_sign=closed_loop.ADAPTIVE_ROLL_LEFT_IMU_SIGN,
+            )
         current_pose = self._adaptive_transition(
             "standard",
             current_pose,

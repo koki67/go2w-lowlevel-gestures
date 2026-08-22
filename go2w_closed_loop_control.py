@@ -109,6 +109,21 @@ MAX_CONVERGED_DQ_RAD_S = 0.20
 # exactly 50% without changing the command safety envelope or speed schedule.
 CONVERGENCE_NUMERIC_MARGIN_RAD = 0.001
 
+# A roll pose needs non-zero position error to generate its static holding
+# torque through position PD.  The generic 50% convergence gate remains the
+# rule for startup, height, and prone return.  Roll endpoints may instead use
+# the deliberately narrower load-aware gate below.  These thresholds are
+# provisional application values backed by MuJoCo, not hardware certification.
+LOADED_ROLL_COMPLETION_RATIO = 0.70
+LOADED_ROLL_PD_RESIDUAL_RATIO = 0.10
+LOADED_ROLL_MAX_DQ_RAD_S = 0.02
+LOADED_ROLL_MIN_SIGNED_BODY_ROLL_RAD = 0.50 * abs(ROLL_RIGHT_REL_RAD)
+# The existing adaptive joint targets produce these signs in the Unitree IMU
+# roll convention (right target positive, left target negative).  WBC task
+# target signs describe a different task-space convention and are not reused.
+ADAPTIVE_ROLL_RIGHT_IMU_SIGN = 1.0
+ADAPTIVE_ROLL_LEFT_IMU_SIGN = -1.0
+
 TORQUE_WARN_RATIO = 0.60
 TORQUE_STOP_RATIO = 0.75
 TORQUE_RETURN_RATIO = 0.85
@@ -346,6 +361,142 @@ class ConvergenceGate:
         )
         self.accumulated_s = self.accumulated_s + dt_s if converged else 0.0
         return self.accumulated_s >= self.dwell_s
+
+
+@dataclass(frozen=True)
+class LoadedRollEquilibriumStatus:
+    completed: bool
+    accumulated_s: float
+    raw_tracking_ratio: float
+    pd_residual_ratio: float
+    torque_ratio: float
+    max_abs_dq_rad_s: float
+    signed_body_roll_rad: float
+    endpoint_reached: bool
+    joint_bound_met: bool
+    pd_balance_met: bool
+    low_velocity_met: bool
+    torque_margin_met: bool
+    roll_direction_met: bool
+
+
+class LoadedRollEquilibriumGate:
+    """Recognize a settled roll whose static load is held by position PD.
+
+    At static equilibrium the measured motor torque should be consistent with
+    ``tau_est = kp * (q_ref - q) - kd * dq``.  This permits the bounded,
+    load-bearing position error needed to hold body roll without treating a
+    moving, obstructed, saturated, or wrong-direction pose as complete.
+    """
+
+    def __init__(
+        self,
+        baseline_roll_rad: float,
+        expected_roll_sign: float,
+        kp: Sequence[float],
+        kd: Sequence[float],
+        *,
+        dwell_s: float = CONVERGENCE_DWELL_S,
+        envelopes: Sequence[float] = TRACKING_ENVELOPE_RAD,
+        torque_limits: Sequence[float] = TORQUE_LIMIT_NM,
+    ) -> None:
+        self.baseline_roll_rad = float(baseline_roll_rad)
+        self.expected_roll_sign = float(expected_roll_sign)
+        self.kp = _vector(kp, 12, "kp")
+        self.kd = _vector(kd, 12, "kd")
+        self.envelopes = _vector(envelopes, 12, "envelopes")
+        self.torque_limits = _vector(torque_limits, 12, "torque_limits")
+        self.dwell_s = float(dwell_s)
+        if not math.isfinite(self.baseline_roll_rad):
+            raise ValueError("baseline_roll_rad must be finite")
+        if self.expected_roll_sign not in (-1.0, 1.0):
+            raise ValueError("expected_roll_sign must be -1 or +1")
+        if not math.isfinite(self.dwell_s) or self.dwell_s <= 0.0:
+            raise ValueError("dwell_s must be positive and finite")
+        if np.any(self.kp <= 0.0) or np.any(self.kd < 0.0):
+            raise ValueError("kp must be positive and kd must be nonnegative")
+        if np.any(self.envelopes <= 0.0) or np.any(self.torque_limits <= 0.0):
+            raise ValueError("envelopes and torque limits must be positive")
+        self.accumulated_s = 0.0
+
+    def update(
+        self,
+        target_q: Sequence[float],
+        measured_q: Sequence[float],
+        measured_dq: Sequence[float],
+        tau_est: Sequence[float],
+        body_roll_rad: float,
+        dt_s: float,
+        *,
+        endpoint_reached: bool,
+    ) -> LoadedRollEquilibriumStatus:
+        target = _vector(target_q, 12, "target_q")
+        measured = _vector(measured_q, 12, "measured_q")
+        velocity = _vector(measured_dq, 12, "measured_dq")
+        torque = _vector(tau_est, 12, "tau_est")
+        roll = float(body_roll_rad)
+        if not math.isfinite(roll):
+            raise ValueError("body_roll_rad must be finite")
+        if not math.isfinite(dt_s) or dt_s < 0.0:
+            raise ValueError("dt_s must be finite and nonnegative")
+
+        error = target - measured
+        raw_tracking_ratio = float(np.max(np.abs(error) / self.envelopes))
+        expected_pd_torque = self.kp * error - self.kd * velocity
+        pd_angle_residual = (torque - expected_pd_torque) / self.kp
+        pd_residual_ratio = float(
+            np.max(np.abs(pd_angle_residual) / self.envelopes)
+        )
+        torque_ratio = float(np.max(np.abs(torque) / self.torque_limits))
+        max_abs_dq = float(np.max(np.abs(velocity)))
+        signed_roll = self.expected_roll_sign * (
+            roll - self.baseline_roll_rad
+        )
+
+        joint_bound_met = bool(
+            np.all(
+                np.abs(error)
+                <= LOADED_ROLL_COMPLETION_RATIO * self.envelopes
+                + CONVERGENCE_NUMERIC_MARGIN_RAD
+            )
+        )
+        pd_balance_met = bool(
+            np.all(
+                np.abs(pd_angle_residual)
+                <= LOADED_ROLL_PD_RESIDUAL_RATIO * self.envelopes
+                + CONVERGENCE_NUMERIC_MARGIN_RAD
+            )
+        )
+        low_velocity_met = max_abs_dq <= LOADED_ROLL_MAX_DQ_RAD_S
+        torque_margin_met = torque_ratio < TORQUE_WARN_RATIO
+        roll_direction_met = (
+            signed_roll >= LOADED_ROLL_MIN_SIGNED_BODY_ROLL_RAD
+        )
+        settled = (
+            bool(endpoint_reached)
+            and joint_bound_met
+            and pd_balance_met
+            and low_velocity_met
+            and torque_margin_met
+            and roll_direction_met
+        )
+        self.accumulated_s = self.accumulated_s + dt_s if settled else 0.0
+
+        return LoadedRollEquilibriumStatus(
+            completed=self.accumulated_s >= self.dwell_s,
+            accumulated_s=self.accumulated_s,
+            raw_tracking_ratio=raw_tracking_ratio,
+            pd_residual_ratio=pd_residual_ratio,
+            torque_ratio=torque_ratio,
+            max_abs_dq_rad_s=max_abs_dq,
+            signed_body_roll_rad=signed_roll,
+            endpoint_reached=bool(endpoint_reached),
+            joint_bound_met=joint_bound_met,
+            pd_balance_met=pd_balance_met,
+            low_velocity_met=low_velocity_met,
+            torque_margin_met=torque_margin_met,
+            roll_direction_met=roll_direction_met,
+        )
 
 
 @dataclass(frozen=True)

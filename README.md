@@ -108,8 +108,21 @@ scheduled speed through 50% of an envelope, slows linearly from 50% to 90%,
 and stops at 90%. A 100% breach sustained for 0.10 s requests a controlled
 captured-prone return. A phase completes only after all joints are within the
 50% convergence gate and maximum joint speed is at most `0.20 rad/s` for
-0.30 s. Wall timeouts are 8 s for a repeated transition, 12 s for startup, and
-15 s for the prone return.
+0.30 s. Startup, height, STANDARD, and prone-return phases keep that gate.
+
+The right/left adaptive roll endpoints use an additional load-aware static-PD
+equilibrium gate because a body roll needs nonzero `q_ref - q` to generate its
+holding torque. It permits at most 70% of each tracking envelope, requires
+`tau_est` to agree with `Kp*(q_ref-q) - Kd*dq` within 10% of the corresponding
+joint envelope, requires `max |dq| <= 0.02 rad/s` and torque below the 60%
+warning threshold, and checks that IMU roll moved at least half of
+`0.395469 rad` in the direction produced by the existing adaptive joint
+target. Every condition must remain true for 0.30 s after trajectory progress
+reaches 100%. The 90% progress stop, full tracking envelope, `0.55 rad` tilt
+watchdog, torque return/error thresholds, and controlled-return behavior are
+unchanged. These roll-gate thresholds are provisional MuJoCo-backed
+application values, not physical qualification. Wall timeouts remain 8 s for
+a repeated transition, 12 s for startup, and 15 s for the prone return.
 
 `go2w_gesture_real_wbc.py` uses the same adaptive startup and return. During
 the gesture it solves a 100 Hz constrained kinematic QP for
@@ -215,6 +228,27 @@ written under `runs/mujoco/closed-loop/`; a nonzero result is retained as
 qualification evidence rather than bypassed. These headless results are
 simulation qualification only.
 
+Adaptive runs can additionally save two human-readable SVGs by adding the
+opt-in `save-plot` goal:
+
+```bash
+make sim-adaptive-height save-plot
+make sim-adaptive-roll save-plot
+```
+
+The Make goal forwards the simulator's `--save-plot` CLI option. Equivalently,
+use `make sim-adaptive-height SIM_ARGS=--save-plot` when composing additional
+simulator arguments.
+
+For each initial condition, one SVG contains the 12 adaptive joint references
+and measured joint angles. The second contains phase-local nominal versus
+adaptive trajectory progress, governor speed scale, normalized tracking error,
+and normalized `tau_est`, including their slowdown, stop, return, and error
+thresholds. Phase bands use the same time axis in both files. A failed or timed
+out case still writes the samples captured before and during its adaptive
+return. The summary JSON records both artifact paths and whether plot
+generation succeeded.
+
 To inspect the exact same adaptive/WBC controller path in MuJoCo's GUI, run one
 initial condition at a time:
 
@@ -223,6 +257,13 @@ make sim-view-adaptive-height
 make sim-view-adaptive-roll
 make sim-view-wbc-height
 make sim-view-wbc-roll
+```
+
+The same adaptive plots can be saved after closing the GUI viewer:
+
+```bash
+make sim-view-adaptive-height save-plot
+make sim-view-adaptive-roll save-plot SIM_INITIAL=normal
 ```
 
 The default is `normal` at real-time speed. Select either prepared failure case
@@ -261,7 +302,7 @@ wet-dog-style shake and is not qualified for hardware.
 
 These default commands do not record or save a joint-tracking graph. To record
 the target and actual joint-angle history and save it as an SVG, add the common
-`save-plot` goal to any simulation run:
+`save-plot` goal to any of these scripted simulation runs:
 
 ```bash
 make sim-height save-plot
@@ -275,9 +316,10 @@ simulator or LowCmd publisher is already active there, starts and owns the
 MuJoCo child process, and stops it on `Ctrl+C`. The repository-owned flat scene
 is assembled in a temporary directory with links to the external Go2W model;
 the external checkout is not modified at runtime. With `--save-plot`, the SVG
-is written under `runs/mujoco/` after 3 seconds of the final hold. These SVGs
-are ignored generated output. Without the flag, tracking samples are not kept
-in memory and no graph is written.
+is written under `runs/mujoco/` after 3 seconds of the final hold. Closed-loop
+adaptive SVGs are written under `runs/mujoco/closed-loop/` after the case ends,
+including failure cases. These SVGs are ignored generated output. Without the
+flag, tracking samples are not kept in memory and no graph is written.
 
 The external checkout's `simulate/config.yaml` and
 `simulate_python/config.py` do not need to be changed: robot, scene, DDS domain,
@@ -554,10 +596,14 @@ or the read-only preflight.
 Adaptive and WBC live runs also write a controller-labelled closed-loop CSV and
 summary JSON. They add `dq`, 16-motor `tau_est`/mode/lost/temperature, IMU gyro
 and acceleration, power, phase progress, speed scale, and publication deadline
-misses. WBC rows additionally include task target/estimate, per-wheel estimated
-force, balance and torque residuals, solver status/iterations/residuals, solve
-time, and contact-velocity residual. The 500 Hz controller only appends rows in
-memory; files are finalized after command publication stops.
+misses. Adaptive roll rows also record every static-PD equilibrium subcondition,
+including dwell, raw tracking ratio, PD residual, signed IMU roll, velocity,
+and the joint/torque/direction gates; the summary contains their ranges and
+provisional thresholds. WBC rows additionally include task target/estimate,
+per-wheel estimated force, balance and torque residuals, solver
+status/iterations/residuals, solve time, and contact-velocity residual. The
+500 Hz controller only appends rows in memory; files are finalized after
+command publication stops.
 
 List the newest files on the Jetson after a run:
 

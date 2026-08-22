@@ -21,6 +21,8 @@ import sys
 import tempfile
 import time
 
+import go2w_adaptive_plot as adaptive_plot
+
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 UNITREE_MUJOCO_ROOT = Path(
@@ -120,10 +122,12 @@ def describe(controller_name=None, gesture=None, initial="all") -> None:
     print("  initial conditions: {}".format(", ".join(initials)))
     print("  cycles per case: 3")
     print("  adaptive transitions/holds: 1.0 s / 0.5 s nominal")
+    print("  adaptive roll completion: load-aware static-PD equilibrium gate")
     print("  WBC QP / position-PD publication: 100 Hz / 500 Hz")
     print("  external MJCF/source are read-only; a temporary scene is used")
     print("  ground truth is evaluation-only, never a controller input")
     print("  --viewer: same controller path in a real-time MuJoCo GUI, one initial condition")
+    print("  --save-plot: adaptive joint tracking and governor SVGs (opt-in)")
     print("  output is simulation qualification, not physical qualification")
 
 
@@ -161,7 +165,13 @@ def quaternion_to_rpy(quaternion):
 
 
 class HeadlessHarness:
-    def __init__(self, initial_condition, viewer_enabled=False, viewer_speed=1.0):
+    def __init__(
+        self,
+        initial_condition,
+        viewer_enabled=False,
+        viewer_speed=1.0,
+        record_adaptive_plot=False,
+    ):
         self.initial_condition = initial_condition
         self._scene_workspace = tempfile.TemporaryDirectory(
             prefix="go2w-closed-loop-mujoco-"
@@ -202,6 +212,12 @@ class HeadlessHarness:
         self.controlled_return_attempted = False
         self.controlled_return_succeeded = False
         self.controlled_return_error = None
+        self._adaptive_plot_time_origin_s = None
+        self._adaptive_plot_recorder = adaptive_plot.AdaptivePlotRecorder(
+            record_adaptive_plot,
+            control.JOINT_NAMES,
+            control.TRACKING_ENVELOPE_RAD,
+        )
 
     def close(self):
         viewer = self.viewer
@@ -295,6 +311,40 @@ class HeadlessHarness:
         self.controlled_return_attempted = False
         self.controlled_return_succeeded = False
         self.controlled_return_error = None
+        self._adaptive_plot_time_origin_s = float(self.data.time)
+
+    def _record_adaptive_plot_sample(
+        self,
+        phase,
+        phase_elapsed_s,
+        phase_duration_s,
+        measured_q,
+        decision,
+    ):
+        if not self._adaptive_plot_recorder.enabled:
+            return
+        if self._adaptive_plot_time_origin_s is None:
+            raise RuntimeError("adaptive plot time origin was not initialized")
+        self._adaptive_plot_recorder.record(
+            time_s=float(self.data.time) - self._adaptive_plot_time_origin_s,
+            phase=phase,
+            phase_elapsed_s=phase_elapsed_s,
+            phase_duration_s=phase_duration_s,
+            progress=decision.progress,
+            speed_scale=decision.speed_scale,
+            tracking_ratio=decision.tracking_ratio,
+            torque_ratio=decision.torque_ratio,
+            q_ref=decision.q_ref,
+            q_measured=measured_q,
+            event=(
+                decision.reason
+                if decision.emergency or decision.request_return
+                else None
+            ),
+        )
+
+    def write_adaptive_plots(self, output_dir, stem):
+        return self._adaptive_plot_recorder.write(Path(output_dir), stem)
 
     def state(self):
         sensor = self.data.sensordata
@@ -442,12 +492,42 @@ class HeadlessHarness:
         self.reset_evaluation_metrics()
         return captured
 
-    def adaptive_phase(self, name, source, target, duration_s, timeout_s, return_mode=False):
+    def adaptive_phase(
+        self,
+        name,
+        source,
+        target,
+        duration_s,
+        timeout_s,
+        return_mode=False,
+        *,
+        loaded_roll_baseline_rad=None,
+        loaded_roll_expected_sign=None,
+    ):
         self.set_phase("adaptive {}".format(name))
         governor = control.ReferenceGovernor(source, target, duration_s, timeout_s)
+        loaded_roll_requested = (
+            loaded_roll_baseline_rad is not None
+            or loaded_roll_expected_sign is not None
+        )
+        if loaded_roll_requested and (
+            loaded_roll_baseline_rad is None
+            or loaded_roll_expected_sign is None
+        ):
+            raise ValueError(
+                "loaded roll completion requires both baseline and expected sign"
+            )
+        loaded_roll_gate = None
+        if loaded_roll_requested:
+            loaded_roll_gate = control.LoadedRollEquilibriumGate(
+                loaded_roll_baseline_rad,
+                loaded_roll_expected_sign,
+                hardware.KP,
+                hardware.KD,
+            )
         elapsed = 0.0
         while True:
-            q, dq, tau, _rpy = self.check_runtime_state(
+            q, dq, tau, rpy = self.check_runtime_state(
                 governor.current_ref, self.phase
             )
             decision = governor.step(
@@ -458,22 +538,66 @@ class HeadlessHarness:
                 elapsed,
                 return_mode=return_mode,
             )
+            phase_completed = decision.completed
+            loaded_status = None
+            if loaded_roll_gate is not None:
+                loaded_status = loaded_roll_gate.update(
+                    decision.q_ref,
+                    q,
+                    dq,
+                    tau,
+                    rpy[0],
+                    self.dt,
+                    endpoint_reached=decision.progress >= 1.0,
+                )
+                phase_completed = loaded_status.completed
+            self._record_adaptive_plot_sample(
+                name,
+                elapsed,
+                duration_s,
+                q,
+                decision,
+            )
             if decision.emergency or decision.request_return:
                 raise SimulationFailure(
                     "{}: {}".format(name, decision.reason or "governor stopped")
                 )
             self.step(decision.q_ref)
             elapsed += self.dt
-            if decision.completed:
-                self.phase_records.append(
-                    {
-                        "phase": name,
-                        "elapsed_s": elapsed,
-                        "progress": decision.progress,
-                        "tracking_ratio": decision.tracking_ratio,
-                        "tau_ratio": decision.torque_ratio,
-                    }
-                )
+            if phase_completed:
+                record = {
+                    "phase": name,
+                    "elapsed_s": elapsed,
+                    "progress": decision.progress,
+                    "tracking_ratio": decision.tracking_ratio,
+                    "tau_ratio": decision.torque_ratio,
+                    "completion_gate": (
+                        "loaded-roll-static-pd"
+                        if loaded_status is not None
+                        else "default-50-percent"
+                    ),
+                }
+                if loaded_status is not None:
+                    record.update(
+                        {
+                            "loaded_roll_gate_dwell_s": (
+                                loaded_status.accumulated_s
+                            ),
+                            "loaded_roll_raw_tracking_ratio": (
+                                loaded_status.raw_tracking_ratio
+                            ),
+                            "loaded_roll_pd_residual_ratio": (
+                                loaded_status.pd_residual_ratio
+                            ),
+                            "loaded_roll_signed_body_roll_rad": (
+                                loaded_status.signed_body_roll_rad
+                            ),
+                            "loaded_roll_max_abs_dq_rad_s": (
+                                loaded_status.max_abs_dq_rad_s
+                            ),
+                        }
+                    )
+                self.phase_records.append(record)
                 return decision.q_ref.copy()
 
     def adaptive_sequence(self, gesture, captured_prone):
@@ -491,18 +615,37 @@ class HeadlessHarness:
             hardware.STANDARD_HOLD_S,
             hardware.STANDARD_HOLD_S + control.HOLD_CONVERGENCE_TIMEOUT_S,
         )
+        standard_roll_rad = float(self.state()[3][0])
         if gesture == "height":
-            sides = (("low", hardware.LOW), ("high", hardware.HIGH))
+            sides = (("low", hardware.LOW, None), ("high", hardware.HIGH, None))
         else:
-            sides = (("right", hardware.ROLL_RIGHT), ("left", hardware.ROLL_LEFT))
+            sides = (
+                (
+                    "right",
+                    hardware.ROLL_RIGHT,
+                    control.ADAPTIVE_ROLL_RIGHT_IMU_SIGN,
+                ),
+                (
+                    "left",
+                    hardware.ROLL_LEFT,
+                    control.ADAPTIVE_ROLL_LEFT_IMU_SIGN,
+                ),
+            )
         for cycle in range(1, 4):
-            for side, target in sides:
+            for side, target, expected_roll_sign in sides:
+                loaded_roll_options = {}
+                if expected_roll_sign is not None:
+                    loaded_roll_options = {
+                        "loaded_roll_baseline_rad": standard_roll_rad,
+                        "loaded_roll_expected_sign": expected_roll_sign,
+                    }
                 current = self.adaptive_phase(
                     "transition-{}-{}".format(cycle, side),
                     current,
                     target,
                     1.0,
                     control.FAST_TRANSITION_TIMEOUT_S,
+                    **loaded_roll_options,
                 )
                 current = self.adaptive_phase(
                     "hold-{}-{}".format(cycle, side),
@@ -510,6 +653,7 @@ class HeadlessHarness:
                     target,
                     0.5,
                     0.5 + control.HOLD_CONVERGENCE_TIMEOUT_S,
+                    **loaded_roll_options,
                 )
             self.cycles_completed = cycle
         current = self.adaptive_phase(
@@ -878,14 +1022,25 @@ def run_case(
     viewer_enabled=False,
     viewer_speed=1.0,
     viewer_hold=False,
+    save_plot=False,
+    plot_output_dir=None,
+    plot_stem=None,
 ):
     harness = HeadlessHarness(
         initial_condition,
         viewer_enabled=viewer_enabled,
         viewer_speed=viewer_speed,
+        record_adaptive_plot=save_plot,
     )
     captured = None
     error = None
+    plot_artifacts = {
+        "requested": bool(save_plot),
+        "sample_count": 0,
+        "joint_tracking_svg": None,
+        "adaptive_governor_svg": None,
+        "generation_error": None,
+    }
     try:
         captured = harness.prepare()
         if controller_name == "adaptive":
@@ -926,7 +1081,19 @@ def run_case(
             captured = harness.state()[0].copy()
         if viewer_hold:
             harness.hold_viewer_until_closed()
+        if save_plot:
+            try:
+                if plot_output_dir is None or plot_stem is None:
+                    raise RuntimeError("plot output directory and stem are required")
+                plot_artifacts.update(
+                    harness.write_adaptive_plots(plot_output_dir, plot_stem)
+                )
+            except Exception as plot_error:
+                plot_artifacts["generation_error"] = "{}: {}".format(
+                    type(plot_error).__name__, plot_error
+                )
         summary = harness.summary(controller_name, gesture, captured, error=error)
+        summary["plot_artifacts"] = plot_artifacts
         harness.close()
     return summary
 
@@ -959,6 +1126,11 @@ def parse_args(argv=None):
         action="store_true",
         help="keep the final/failure state visible until the viewer window is closed",
     )
+    parser.add_argument(
+        "--save-plot",
+        action="store_true",
+        help="save adaptive joint-tracking and reference-governor SVGs after the run",
+    )
     parser.add_argument("--describe", action="store_true")
     parser.add_argument("--doctor", action="store_true")
     return parser.parse_args(argv)
@@ -971,6 +1143,8 @@ def argument_error(args):
         return "--viewer-hold requires --viewer"
     if not math.isfinite(args.viewer_speed) or args.viewer_speed <= 0.0:
         return "--viewer-speed must be a positive finite number"
+    if args.save_plot and args.controller != "adaptive":
+        return "--save-plot currently requires --controller adaptive"
     return None
 
 
@@ -998,6 +1172,10 @@ def main(argv=None):
         INITIAL_CONDITIONS if args.initial == "all" else (args.initial,)
     )
     created_at = datetime.now().astimezone()
+    output_dir = Path(args.output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = created_at.strftime("%Y%m%dT%H%M%S_%f%z")
+    mode_suffix = "_viewer" if args.viewer else ""
     cases = []
     for initial_condition in initial_conditions:
         print(
@@ -1013,6 +1191,15 @@ def main(argv=None):
             viewer_enabled=args.viewer,
             viewer_speed=args.viewer_speed,
             viewer_hold=args.viewer_hold,
+            save_plot=args.save_plot,
+            plot_output_dir=output_dir,
+            plot_stem="{}_{}_{}{}_{}".format(
+                timestamp,
+                args.controller,
+                args.gesture,
+                mode_suffix,
+                initial_condition,
+            ),
         )
         cases.append(case)
         print(
@@ -1024,15 +1211,37 @@ def main(argv=None):
         )
         if case["error"]:
             print(case["error"], file=sys.stderr, flush=True)
+        artifacts = case["plot_artifacts"]
+        if artifacts["requested"]:
+            if artifacts["generation_error"] is not None:
+                print(
+                    "plot generation failed: {}".format(
+                        artifacts["generation_error"]
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    "adaptive joint plot: {}".format(
+                        artifacts["joint_tracking_svg"]
+                    ),
+                    flush=True,
+                )
+                print(
+                    "adaptive governor plot: {}".format(
+                        artifacts["adaptive_governor_svg"]
+                    ),
+                    flush=True,
+                )
 
-    output_dir = Path(args.output_dir).expanduser()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = created_at.strftime("%Y%m%dT%H%M%S_%f%z")
-    mode_suffix = "_viewer" if args.viewer else ""
     output_path = output_dir / "{}_{}_{}{}_qualification.summary.json".format(
         timestamp, args.controller, args.gesture, mode_suffix
     )
     overall_pass = all(case["simulation_pass"] for case in cases)
+    plot_generation_pass = not args.save_plot or all(
+        case["plot_artifacts"]["generation_error"] is None for case in cases
+    )
     document = {
         "schema_version": 1,
         "created_at": created_at.isoformat(),
@@ -1040,6 +1249,8 @@ def main(argv=None):
         "gesture": args.gesture,
         "execution_mode": "viewer-inspection" if args.viewer else "headless-qualification",
         "viewer_speed": args.viewer_speed if args.viewer else None,
+        "plots_requested": args.save_plot,
+        "plot_generation_pass": plot_generation_pass,
         "model_path": str(MODEL_XML),
         "model_sha256": control.MODEL_SOURCE_SHA256,
         "cases": cases,
@@ -1058,7 +1269,12 @@ def main(argv=None):
         ),
         flush=True,
     )
-    return 0 if overall_pass else 1
+    if args.save_plot:
+        print(
+            "PLOT GENERATION {}".format("PASS" if plot_generation_pass else "FAIL"),
+            flush=True,
+        )
+    return 0 if overall_pass and plot_generation_pass else 1
 
 
 if __name__ == "__main__":

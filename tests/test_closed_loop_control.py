@@ -88,6 +88,124 @@ class ReferenceGovernorTests(unittest.TestCase):
         self.assertTrue(emergency.emergency)
 
 
+class LoadedRollEquilibriumGateTests(unittest.TestCase):
+    def make_loaded_state(self):
+        target = np.zeros(12)
+        error = 0.63 * control.TRACKING_ENVELOPE_RAD
+        measured = target - error
+        velocity = np.zeros(12)
+        kp = np.asarray(hardware.KP, dtype=float)
+        kd = np.asarray(hardware.KD, dtype=float)
+        torque = kp * error - kd * velocity
+        return target, measured, velocity, torque
+
+    def make_gate(self, sign=1.0):
+        return control.LoadedRollEquilibriumGate(
+            0.0,
+            sign,
+            hardware.KP,
+            hardware.KD,
+        )
+
+    def test_static_pd_holding_error_completes_loaded_roll_but_not_default_gate(self):
+        target, measured, velocity, torque = self.make_loaded_state()
+        default_gate = control.ConvergenceGate()
+        loaded_gate = self.make_gate()
+        status = None
+        for _index in range(31):
+            self.assertFalse(
+                default_gate.update(target, measured, velocity, 0.01)
+            )
+            status = loaded_gate.update(
+                target,
+                measured,
+                velocity,
+                torque,
+                0.48,
+                0.01,
+                endpoint_reached=True,
+            )
+        self.assertIsNotNone(status)
+        self.assertTrue(status.completed)
+        self.assertTrue(status.pd_balance_met)
+        self.assertAlmostEqual(status.raw_tracking_ratio, 0.63)
+        self.assertLess(status.pd_residual_ratio, 1.0e-12)
+
+    def test_loaded_roll_gate_rejects_wrong_direction_motion_torque_and_error(self):
+        target, measured, velocity, torque = self.make_loaded_state()
+        cases = (
+            (
+                "wrong roll direction",
+                measured,
+                velocity,
+                torque,
+                -0.48,
+                {"roll_direction_met": False},
+            ),
+            (
+                "still moving",
+                measured,
+                np.full(12, control.LOADED_ROLL_MAX_DQ_RAD_S + 0.001),
+                torque,
+                0.48,
+                {"low_velocity_met": False},
+            ),
+            (
+                "unexplained torque",
+                measured,
+                velocity,
+                np.zeros(12),
+                0.48,
+                {"pd_balance_met": False},
+            ),
+            (
+                "torque margin",
+                measured,
+                velocity,
+                control.TORQUE_WARN_RATIO * control.TORQUE_LIMIT_NM,
+                0.48,
+                {"torque_margin_met": False},
+            ),
+            (
+                "raw joint bound",
+                target - 0.71 * control.TRACKING_ENVELOPE_RAD,
+                velocity,
+                np.asarray(hardware.KP)
+                * (0.71 * control.TRACKING_ENVELOPE_RAD),
+                0.48,
+                {"joint_bound_met": False},
+            ),
+        )
+        for name, case_q, case_dq, case_tau, roll, expected in cases:
+            with self.subTest(name=name):
+                status = self.make_gate().update(
+                    target,
+                    case_q,
+                    case_dq,
+                    case_tau,
+                    roll,
+                    0.31,
+                    endpoint_reached=True,
+                )
+                self.assertFalse(status.completed)
+                for field, value in expected.items():
+                    self.assertEqual(getattr(status, field), value)
+
+    def test_loaded_roll_gate_never_completes_before_path_endpoint(self):
+        target, measured, velocity, torque = self.make_loaded_state()
+        status = self.make_gate().update(
+            target,
+            measured,
+            velocity,
+            torque,
+            0.48,
+            1.0,
+            endpoint_reached=False,
+        )
+        self.assertFalse(status.completed)
+        self.assertEqual(status.accumulated_s, 0.0)
+
+
 class KinematicsAndContactTests(unittest.TestCase):
     def test_analytic_leg_jacobians_match_finite_difference(self):
         q = np.asarray(hardware.STANDARD, dtype=float)

@@ -41,6 +41,7 @@ class AdaptiveHardwareTests(unittest.TestCase):
         controller._captured_prone = list(PRONE)
         controller._ended_prone = False
         controller._capture_extended_baseline = mock.Mock()
+        controller._check_extended_runtime = mock.Mock()
         controller._latest_sample = mock.Mock(return_value=extended_sample(PRONE))
         transitions = []
         holds = []
@@ -73,6 +74,34 @@ class AdaptiveHardwareTests(unittest.TestCase):
                 self.assertEqual(len(repeated_holds), 6)
                 self.assertTrue(all(item[1] == 1.0 for item in repeated_transitions))
                 self.assertTrue(all(item[1] == 0.5 for item in repeated_holds))
+                if gesture == "roll":
+                    expected_signs = [
+                        adaptive.closed_loop.ADAPTIVE_ROLL_RIGHT_IMU_SIGN,
+                        adaptive.closed_loop.ADAPTIVE_ROLL_LEFT_IMU_SIGN,
+                    ] * 3
+                    self.assertEqual(
+                        [
+                            item[3]["loaded_roll_expected_sign"]
+                            for item in repeated_transitions
+                        ],
+                        expected_signs,
+                    )
+                    self.assertEqual(
+                        [
+                            item[2]["loaded_roll_expected_sign"]
+                            for item in repeated_holds
+                        ],
+                        expected_signs,
+                    )
+                    self.assertTrue(
+                        all(
+                            item[3]["loaded_roll_baseline_rad"] == 0.0
+                            for item in repeated_transitions
+                        )
+                    )
+                else:
+                    self.assertTrue(all(not item[3] for item in repeated_transitions))
+                    self.assertTrue(all(not item[2] for item in repeated_holds))
                 controller._finish_adaptive_at_prone.assert_called_once()
 
     def test_mode_change_and_lost_increment_fail_closed(self):
@@ -127,6 +156,7 @@ class AdaptiveHardwareTests(unittest.TestCase):
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             self.assertEqual(summary["power_v"]["minimum"], 30.0)
             self.assertEqual(summary["power_a"]["maximum"], 1.0)
+            self.assertFalse(summary["adaptive_roll_equilibrium"]["active"])
             self.assertEqual(
                 summary["temperature_raw_by_motor"]["FR_hip"]["maximum"],
                 30.0,

@@ -16,6 +16,7 @@ import go2w_height_sequence_sim as height
 import go2w_quick_stand_sequence_sim as quick_stand
 import go2w_roll_sequence_sim as roll
 import go2w_shake_off_sequence_sim as shake_off
+import go2w_adaptive_plot as adaptive_plot
 import go2w_closed_loop_sequence_sim as closed_loop
 
 
@@ -30,6 +31,40 @@ class SimulationContractTests(unittest.TestCase):
                     sys, "argv", [module.__name__, "--save-plot"]
                 ):
                     self.assertTrue(module.parse_args().save_plot)
+
+        with mock.patch.object(sys, "argv", ["closed-loop"]):
+            self.assertFalse(closed_loop.parse_args().save_plot)
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "closed-loop",
+                "--controller",
+                "adaptive",
+                "--gesture",
+                "height",
+                "--save-plot",
+            ],
+        ):
+            args = closed_loop.parse_args()
+        self.assertTrue(args.save_plot)
+        self.assertIsNone(closed_loop.argument_error(args))
+
+    def test_closed_loop_plot_rejects_wbc_to_avoid_mislabelled_governor_output(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "closed-loop",
+                "--controller",
+                "wbc",
+                "--gesture",
+                "height",
+                "--save-plot",
+            ],
+        ):
+            args = closed_loop.parse_args()
+        self.assertIn("requires --controller adaptive", closed_loop.argument_error(args))
 
     def test_tracking_samples_are_only_buffered_when_plot_saving_is_enabled(self):
         def make_controller(save_plot):
@@ -58,6 +93,109 @@ class SimulationContractTests(unittest.TestCase):
         self.assertEqual(saving_controller._tracking_times, [0.0])
         self.assertEqual(saving_controller._tracking_targets, [height.STANDARD])
         self.assertEqual(len(saving_controller._tracking_actuals), 1)
+
+    def test_adaptive_plot_recording_is_opt_in_and_writes_two_valid_svgs(self):
+        names = tuple("joint_{}".format(index) for index in range(12))
+        envelopes = (0.2,) * 12
+        disabled = adaptive_plot.AdaptivePlotRecorder(False, names, envelopes)
+        disabled.record(
+            time_s=0.0,
+            phase="startup-standard",
+            phase_elapsed_s=0.0,
+            phase_duration_s=2.0,
+            progress=0.0,
+            speed_scale=1.0,
+            tracking_ratio=0.0,
+            torque_ratio=0.0,
+            q_ref=(0.0,) * 12,
+            q_measured=(0.0,) * 12,
+        )
+        self.assertEqual(disabled.samples, [])
+
+        recorder = adaptive_plot.AdaptivePlotRecorder(True, names, envelopes)
+        for index in range(8):
+            phase = "startup-standard" if index < 4 else "transition-1-low"
+            local_index = index if index < 4 else index - 4
+            reference = tuple(0.1 * index for _ in range(12))
+            measured = tuple(
+                value - (0.02 if joint == index % 12 else 0.0)
+                for joint, value in enumerate(reference)
+            )
+            recorder.record(
+                time_s=0.1 * index,
+                phase=phase,
+                phase_elapsed_s=0.1 * local_index,
+                phase_duration_s=0.3,
+                progress=min(1.0, 0.25 * local_index),
+                speed_scale=1.0 if index < 2 else 0.5,
+                tracking_ratio=0.1 * index,
+                torque_ratio=0.05 * index,
+                q_ref=reference,
+                q_measured=measured,
+                event=(
+                    "phase wall timeout exceeded 8.000 s" if index == 7 else None
+                ),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            artifacts = recorder.write(Path(temporary_directory), "adaptive-test")
+            joint_path = Path(artifacts["joint_tracking_svg"])
+            governor_path = Path(artifacts["adaptive_governor_svg"])
+            self.assertTrue(joint_path.is_file())
+            self.assertTrue(governor_path.is_file())
+            self.assertEqual(artifacts["sample_count"], 8)
+            ET.parse(joint_path)
+            ET.parse(governor_path)
+            joint_svg = joint_path.read_text(encoding="utf-8")
+            governor_svg = governor_path.read_text(encoding="utf-8")
+            self.assertIn("adaptive target", joint_svg)
+            self.assertIn("joint_11", joint_svg)
+            self.assertIn("Phase progress", governor_svg)
+            self.assertIn("time-only nominal", governor_svg)
+            self.assertIn("progress stop", governor_svg)
+            self.assertIn("move 1-low", governor_svg)
+            self.assertIn("phase wall timeout exceeded 8.000 s", governor_svg)
+
+    def test_run_case_attaches_requested_adaptive_plot_artifacts(self):
+        class FakeHarness:
+            def __init__(self, initial_condition, **kwargs):
+                self.initial_condition = initial_condition
+                self.recording_requested = kwargs["record_adaptive_plot"]
+
+            def prepare(self):
+                return [0.0] * 12
+
+            def adaptive_sequence(self, _gesture, _captured):
+                pass
+
+            def write_adaptive_plots(self, output_dir, stem):
+                self.plot_call = (Path(output_dir), stem)
+                return {
+                    "sample_count": 123,
+                    "joint_tracking_svg": "/tmp/joints.svg",
+                    "adaptive_governor_svg": "/tmp/governor.svg",
+                }
+
+            def summary(self, _controller, _gesture, _captured, error=None):
+                return {"simulation_pass": error is None, "error": error}
+
+            def close(self):
+                pass
+
+        with mock.patch.object(closed_loop, "HeadlessHarness", FakeHarness):
+            summary = closed_loop.run_case(
+                "adaptive",
+                "height",
+                "normal",
+                save_plot=True,
+                plot_output_dir="/tmp/output",
+                plot_stem="run-normal",
+            )
+        artifacts = summary["plot_artifacts"]
+        self.assertTrue(artifacts["requested"])
+        self.assertEqual(artifacts["sample_count"], 123)
+        self.assertEqual(artifacts["generation_error"], None)
+        self.assertEqual(artifacts["adaptive_governor_svg"], "/tmp/governor.svg")
 
     def test_height_targets_are_owned_by_hardware_controller(self):
         self.assertEqual(height.STANDARD, hardware.STANDARD)
