@@ -598,6 +598,12 @@ class ControlledReturnRequested(Exception):
 
 
 class HardwareGestureController:
+    def _live_initial_pose_instruction(self):
+        return (
+            "Ensure the robot is belly-down on a flat floor, wheels are blocked, "
+            "a support/spotter is present, and the hardware E-stop is held ready."
+        )
+
     def __init__(
         self,
         interface,
@@ -1446,11 +1452,7 @@ class HardwareGestureController:
                 file=sys.stderr,
                 flush=True,
             )
-        print(
-            "Ensure the robot is belly-down on a flat floor, wheels are blocked, "
-            "a support/spotter is present, and the hardware E-stop is held ready.",
-            flush=True,
-        )
+        print(self._live_initial_pose_instruction(), flush=True)
         if self.require_live_confirmation:
             confirmation = LIVE_CONFIRMATIONS[self.gesture]
             entered = input(

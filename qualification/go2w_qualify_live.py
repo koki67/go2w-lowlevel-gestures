@@ -24,7 +24,10 @@ from typing import Iterable, Optional
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = WORKSPACE_ROOT / "runs" / "qualification"
-EXPECTED_BRANCH = "feat/adaptive-wbc-gestures"
+# The closed-loop controllers are published on main.  Requiring the historical
+# implementation branch makes every current Jetson qualification fail before
+# its software checks can run.
+EXPECTED_BRANCH = "main"
 EXPECTED_ARCHITECTURE = "aarch64"
 DEFAULT_INTERFACE = "eth0"
 DEFAULT_EXPECTED_IP = "192.168.123.18"
@@ -207,8 +210,13 @@ def relative_controller_log_dir(run_directory: Path) -> str:
 
 def physical_checklist(run: QualificationRun) -> None:
     run.emit("実機チェックリスト（すべて確認してから入力）:")
-    run.emit("  1. Go2Wの電源が入り、belly-downで静止している")
-    run.emit("  2. 4輪を固定し、腹部クリアランス用の支持具を配置した")
+    if run.controller == "wbc":
+        run.emit("  1. Go2Wが実績上もっとも安定した単一の初期姿勢で静止している")
+        run.emit("  2. 4輪が床に荷重し、腹部は床にも支持具にも接触していない")
+        run.emit("     （非対称姿勢や腹部荷重姿勢は今回の実機試験対象に含めない）")
+    else:
+        run.emit("  1. Go2Wの電源が入り、belly-downで静止している")
+        run.emit("  2. 4輪を固定し、腹部クリアランス用の支持具を配置した")
     run.emit("  3. spotterが付き、ハードウェアE-stopを即時操作できる")
     run.emit("  4. rt/lowcmdの単独所有を確認し、他の運動制御を停止した")
     run.emit("  5. 異常時は残りのliveを中止し、再試行しない")
@@ -356,6 +364,12 @@ def main(argv=None) -> int:
             "physical_pass_requires_manual_review": bool(args.live),
             "automatic_retry": False,
             "no_tracking_stop_fallback": False,
+            "physical_initial_pose_scope": (
+                "single-proven-stable-four-wheel-loaded-belly-clear"
+                if args.controller == "wbc"
+                else "stable-belly-down"
+            ),
+            "alternate_initial_pose_cases_planned": False,
         }
         summary_path.write_text(
             json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False) + "\n",

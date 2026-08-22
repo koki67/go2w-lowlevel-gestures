@@ -52,7 +52,10 @@ closed-loop controllers.
 - Required IPv4 address on `eth0`: `192.168.123.18`.
 - Docker Engine with the Compose plugin.
 - The container uses host networking so CycloneDDS sees the Jetson's `eth0`.
-- Robot starts belly-down and motionless on a flat floor.
+- Scripted and adaptive profiles start belly-down and motionless on a flat
+  floor. The WBC physical campaign instead uses one previously proven, most
+  stable initial pose with all four wheels loaded and the belly clear; no
+  asymmetric or belly-loaded physical initial variants are planned.
 - Wheels are physically blocked; a support/spotter and hardware E-stop are
   immediately available.
 - No other user low-level controller is running.
@@ -109,7 +112,8 @@ scheduled speed through 50% of an envelope, slows linearly from 50% to 90%,
 and stops at 90%. A 100% breach sustained for 0.10 s requests a controlled
 captured-prone return. A phase completes only after all joints are within the
 50% convergence gate and maximum joint speed is at most `0.20 rad/s` for
-0.30 s. Startup, height, STANDARD, and prone-return phases keep that gate.
+0.30 s. Adaptive startup, height, STANDARD, and prone-return phases keep that
+gate.
 
 The right/left adaptive roll endpoints use an additional load-aware static-PD
 equilibrium gate because a body roll needs nonzero `q_ref - q` to generate its
@@ -125,8 +129,12 @@ unchanged. These roll-gate thresholds are provisional MuJoCo-backed
 application values, not physical qualification. Wall timeouts remain 8 s for
 a repeated transition, 12 s for startup, and 15 s for the prone return.
 
-`go2w_gesture_real_wbc.py` uses the same adaptive startup and return. During
-the gesture it solves a 100 Hz constrained kinematic QP for
+`go2w_gesture_real_wbc.py` uses the same adaptive startup command path,
+50%-of-envelope convergence gate, and return. It must then pass the independent
+contact-estimation gate continuously for 0.5 s and the operator's four-wheel
+support/belly-clear check before any WBC task motion begins. Contact-QP and
+minimum-load monitoring remain active throughout the task. During the gesture
+it solves a 100 Hz constrained kinematic QP for
 `[base twist 6, leg dq 12]`, integrates a bounded position reference, and
 resends that reference through the existing 500 Hz position PD. It keeps every
 LowCmd `tau` field at zero. This is a quasi-static kinematic WBC, not a
@@ -245,7 +253,10 @@ position/velocity, actuator torque, and IMU-equivalent inputs. Simulator base
 pose, contacts, and actuator force are evaluation-only. JSON summaries are
 written under `runs/mujoco/closed-loop/`; a nonzero result is retained as
 qualification evidence rather than bypassed. These headless results are
-simulation qualification only.
+simulation qualification only. The asymmetric and belly-loaded cases remain
+diagnostic robustness cases; they are not planned physical initial conditions.
+The WBC hardware campaign uses only the previously proven stable, four-wheel-
+loaded, belly-clear pose.
 
 Closed-loop runs do not buffer or write plot data by default. Adaptive runs can
 save two human-readable SVGs by adding the opt-in `save-plot` goal:
@@ -499,7 +510,9 @@ RUN GO2W ROLL LOW LEVEL
 
 The live ownership sequence is common to both gestures:
 
-1. Confirm a stable, belly-down measured pose.
+1. Confirm the selected stable measured pose. For WBC this is the single
+   previously proven pose with all four wheels loaded and the belly clear; do
+   not substitute an asymmetric or belly-loaded initial pose.
 2. Require the gesture-specific interactive phrase, except for the two
    `live-fast-no-tracking-stop-*` targets, which start automatically.
 3. If `CheckMode()` reported an active Sport service, save its exact name, send
@@ -528,16 +541,39 @@ or SHA, non-`aarch64` host, NIC/IP mismatch, build failure, test failure,
 not stash, reset, delete, retry, select another gesture, or invoke a
 no-tracking-stop fallback.
 
-After the desktop-qualified feature commit has been pushed, run these on the
-Jetson in this exact order, replacing `<desktop-qualified-sha>` with the full
-40-character SHA:
+The qualification runner now expects the published `main` branch. On the
+Jetson, fetch and fast-forward `main`, build it, and record the exact 40-character
+SHA before starting a live case:
 
 ```bash
 cd /home/unitree/go2w-lowlevel-gestures
-make qualify-live-adaptive-height QUALIFIED_SHA=<desktop-qualified-sha>
-make qualify-live-adaptive-roll QUALIFIED_SHA=<desktop-qualified-sha>
-make qualify-live-wbc-height QUALIFIED_SHA=<desktop-qualified-sha>
-make qualify-live-wbc-roll QUALIFIED_SHA=<desktop-qualified-sha>
+git fetch --prune origin
+git switch main
+git pull --ff-only origin main
+make build
+QUALIFIED_SHA=$(git rev-parse HEAD)
+```
+
+For WBC-only physical evaluation, run height first and review its artifacts
+before proceeding to roll:
+
+```bash
+make qualify-live-wbc-height QUALIFIED_SHA="$QUALIFIED_SHA"
+make qualify-live-wbc-roll QUALIFIED_SHA="$QUALIFIED_SHA"
+```
+
+Both WBC cases use the same operator-selected stable initial pose. This
+physical campaign does not include the simulator's `asymmetric-prone` or
+`belly-loaded-prone` diagnostic preparations.
+
+The same runner also supports the complete adaptive/WBC sequence when that is
+the intended campaign:
+
+```bash
+make qualify-live-adaptive-height QUALIFIED_SHA="$QUALIFIED_SHA"
+make qualify-live-adaptive-roll QUALIFIED_SHA="$QUALIFIED_SHA"
+make qualify-live-wbc-height QUALIFIED_SHA="$QUALIFIED_SHA"
+make qualify-live-wbc-roll QUALIFIED_SHA="$QUALIFIED_SHA"
 ```
 
 Before each live child starts, the runner prints a Japanese physical checklist
@@ -719,8 +755,9 @@ hierarchy; the checkout itself is not patched.
   authority for each controller/gesture/initial-condition result; a failed
   case is not converted into a pass by documentation.
 - Closed-loop Jetson software qualification and the four full-amplitude,
-  three-cycle physical cases: not yet completed. Until all four are reviewed
-  as passing, the feature branch must not be merged into `main`.
+  three-cycle physical cases: not yet completed. The implementation is present
+  on `main`, but that publication is not evidence of physical qualification;
+  each live case remains a separately reviewed experiment.
 - Go2W roll hardware motion: not yet performed.
 - Automatic Sport Mode restoration after a confirmed prone return: implemented
   and unit-tested, but not yet physically qualified on Go2W hardware.

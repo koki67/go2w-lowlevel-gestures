@@ -190,6 +190,16 @@ class AdaptiveHardwareTests(unittest.TestCase):
 
 
 class WBCHardwareTests(unittest.TestCase):
+    def test_wbc_live_instruction_requires_single_stable_belly_clear_pose(self):
+        controller = object.__new__(wbc.WBCGestureController)
+
+        instruction = controller._live_initial_pose_instruction()
+
+        self.assertIn("single proven stable initial pose", instruction)
+        self.assertIn("all four wheels are loaded", instruction)
+        self.assertIn("belly is clear", instruction)
+        self.assertNotIn("belly-down", instruction)
+
     def make_controller(self, gesture):
         controller = object.__new__(wbc.WBCGestureController)
         controller.gesture = gesture

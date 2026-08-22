@@ -58,6 +58,14 @@ def print_wbc_plan(gesture=None, timing=base.FAST_TIMING):
 
 
 class WBCGestureController(adaptive.AdaptiveGestureController):
+    def _live_initial_pose_instruction(self):
+        return (
+            "Ensure the robot is in the single proven stable initial pose on a "
+            "flat floor, all four wheels are loaded, the belly is clear of the "
+            "floor and support fixture, wheels are blocked, a support/spotter is "
+            "present, and the hardware E-stop is held ready."
+        )
+
     def __init__(
         self,
         *args,

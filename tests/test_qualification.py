@@ -11,6 +11,24 @@ SHA = "a" * 40
 
 
 class QualificationRunnerTests(unittest.TestCase):
+    def test_wbc_checklist_limits_live_scope_to_one_belly_clear_pose(self):
+        run = mock.Mock(controller="wbc")
+
+        qualifier.physical_checklist(run)
+
+        emitted = "\n".join(call.args[0] for call in run.emit.call_args_list)
+        self.assertIn("もっとも安定した単一の初期姿勢", emitted)
+        self.assertIn("腹部は床にも支持具にも接触していない", emitted)
+        self.assertIn("腹部荷重姿勢は今回の実機試験対象に含めない", emitted)
+
+    def test_published_main_is_the_default_qualification_branch(self):
+        args = qualifier.parse_args(
+            ["--controller", "wbc", "--gesture", "height"]
+        )
+
+        self.assertEqual(qualifier.EXPECTED_BRANCH, "main")
+        self.assertEqual(args.expected_branch, "main")
+
     def common_patches(self):
         return (
             mock.patch.object(
@@ -211,6 +229,12 @@ class QualificationRunnerTests(unittest.TestCase):
             self.assertIn("live-wbc-roll", command)
             self.assertTrue(kwargs["interactive_output"])
             self.assertFalse(any("no-tracking-stop" in part for part in command))
+            summary = self.latest_summary(output_root)
+            self.assertEqual(
+                summary["physical_initial_pose_scope"],
+                "single-proven-stable-four-wheel-loaded-belly-clear",
+            )
+            self.assertFalse(summary["alternate_initial_pose_cases_planned"])
 
     def test_dirty_repository_is_rejected_without_mutation(self):
         with mock.patch.object(
