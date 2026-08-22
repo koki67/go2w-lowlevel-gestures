@@ -457,19 +457,17 @@ make release-mode
 
 The command verifies `eth0 = 192.168.123.18`, initializes DDS domain 0, checks
 the active motion service, and requires `rt/lowcmd` to remain quiet. If Sport is
-active, it requires the typed phrase below, calls `StopMove()`, repeatedly calls
-`ReleaseMode()`, and requires `CheckMode()` to report no active service:
-
-```text
-RELEASE GO2W FOR MANUAL POSITIONING
-```
+active, it prints the safety precheck, calls `StopMove()`, repeatedly calls
+`ReleaseMode()`, and requires `CheckMode()` to report no active service. There
+is no prompt or confirmation input; after the checks pass, the command proceeds
+automatically through completion.
 
 This command never creates or writes a `LowCmd` publisher. Release Mode alone
 is therefore not a low-level joint controller: it removes the active motion
 service and intentionally leaves posture and balance control inactive after
-the process exits. Before confirming, support the body against dropping or
-pinching, block all wheels, keep hands clear, and keep the hardware E-stop
-ready. Move the joints manually only after the terminal prints
+the process exits. Before running the command, support the body against
+dropping or pinching, block all wheels, keep hands clear, and keep the hardware
+E-stop ready. Move the joints manually only after the terminal prints
 `RELEASE MODE READY`, and keep the robot supported throughout preparation.
 
 Once the known initial pose is ready, run the corresponding read-only preflight
@@ -575,8 +573,8 @@ be part of the command and is shown in the live precheck output.
 ## Jetson qualification runner
 
 The four `qualify-live-*` targets fail closed on a dirty worktree, wrong branch,
-`HEAD`/`origin/main` mismatch, non-`aarch64` host, NIC/IP mismatch, build failure,
-test failure, `pip check` failure, describe failure, or read-only preflight failure. They do
+`HEAD`/`origin/main` mismatch, non-`aarch64` host, NIC/IP mismatch, build failure, test failure,
+`pip check` failure, describe failure, or read-only preflight failure. They do
 not stash, reset, delete, retry, select another gesture, or invoke a
 no-tracking-stop fallback.
 

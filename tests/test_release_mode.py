@@ -15,7 +15,6 @@ class ReleaseModeTests(unittest.TestCase):
         controller._sport_client = mock.Mock()
         controller._initialize_dds = mock.Mock()
         controller._wait_for_lowcmd_quiet = mock.Mock()
-        controller._confirm_release = mock.Mock()
         return controller
 
     def test_describe_does_not_load_sdk(self):
@@ -51,10 +50,10 @@ class ReleaseModeTests(unittest.TestCase):
             return_value="192.168.123.18",
         ), mock.patch.object(release_module.time, "sleep"), mock.patch.object(
             release_module.base, "ChannelPublisher"
-        ) as publisher:
+        ) as publisher, mock.patch("builtins.input") as operator_input:
             controller.run()
 
-        controller._confirm_release.assert_called_once_with("1", "ai-w")
+        operator_input.assert_not_called()
         controller._sport_client.StopMove.assert_called_once_with()
         controller._motion_switcher.ReleaseMode.assert_called_once_with()
         self.assertEqual(controller._wait_for_lowcmd_quiet.call_count, 2)
@@ -76,25 +75,12 @@ class ReleaseModeTests(unittest.TestCase):
         ):
             controller.run()
 
-        controller._confirm_release.assert_not_called()
         controller._sport_client.StopMove.assert_not_called()
         controller._motion_switcher.ReleaseMode.assert_not_called()
         controller._wait_for_lowcmd_quiet.assert_called_once_with(
             "manual-positioning release"
         )
         self.assertTrue(controller.mode_released)
-
-    def test_confirmation_mismatch_does_not_change_ownership(self):
-        controller = release_module.ReleaseModeController(
-            "eth0", "192.168.123.18"
-        )
-        with mock.patch.object(
-            release_module.sys.stdin, "isatty", return_value=True
-        ), mock.patch("builtins.input", return_value="NO"):
-            with self.assertRaisesRegex(RuntimeError, "confirmation did not match"):
-                controller._confirm_release("1", "ai-w")
-        self.assertFalse(controller.mode_release_attempted)
-        self.assertFalse(controller.mode_released)
 
     def test_lowcmd_sample_restarts_the_full_quiet_window(self):
         controller = release_module.ReleaseModeController(

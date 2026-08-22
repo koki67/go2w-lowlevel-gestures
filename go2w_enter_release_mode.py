@@ -19,13 +19,10 @@ import time
 import go2w_gesture_real as base
 
 
-RELEASE_CONFIRMATION = "RELEASE GO2W FOR MANUAL POSITIONING"
-
-
 def print_sequence_plan():
     print("Go2W manual initial-pose preparation:")
     print("  1. verify the robot-facing NIC and require rt/lowcmd to be quiet")
-    print("  2. report the active motion service and require a typed confirmation")
+    print("  2. report the active motion service; no operator input is required")
     print("  3. call Sport StopMove() when a service is active")
     print("  4. call ReleaseMode() until CheckMode() reports no active service")
     print("  5. publish no LowCmd and leave the robot released after exit")
@@ -95,10 +92,8 @@ class ReleaseModeController:
             "be active".format(handoff)
         )
 
-    def _confirm_release(self, mode_form, mode_name):
-        if not sys.stdin.isatty():
-            raise RuntimeError("ReleaseMode requires an interactive TTY confirmation")
-        print("\nRELEASE MODE HARDWARE PRECHECK", flush=True)
+    def _report_release_precheck(self, mode_form, mode_name):
+        print("\nRELEASE MODE AUTOMATIC PRECHECK PASSED", flush=True)
         print("  NIC: {} = {}".format(self.interface, self.expected_ip), flush=True)
         print(
             "  active motion service: form={!r}, name={!r}".format(
@@ -118,11 +113,7 @@ class ReleaseModeController:
             "joints manually only while the robot remains supported.",
             flush=True,
         )
-        entered = input("Type {!r} to continue: ".format(RELEASE_CONFIRMATION))
-        if entered.strip() != RELEASE_CONFIRMATION:
-            raise RuntimeError(
-                "release confirmation did not match; controller ownership was not changed"
-            )
+        print("  Proceeding automatically; no operator input is required.", flush=True)
         if self._stop_requested.is_set():
             raise InterruptedError("release interrupted before ownership changed")
 
@@ -187,11 +178,11 @@ class ReleaseModeController:
             )
             return
 
-        self._confirm_release(mode_form, mode_name)
+        self._report_release_precheck(mode_form, mode_name)
         confirmed_form, confirmed_name = self._check_mode()
         if (confirmed_form, confirmed_name) != (mode_form, mode_name):
             raise RuntimeError(
-                "active motion service changed during confirmation: "
+                "active motion service changed during automatic precheck: "
                 "form={!r}, name={!r}; refusing release".format(
                     confirmed_form, confirmed_name
                 )

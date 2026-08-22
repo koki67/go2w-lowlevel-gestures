@@ -264,7 +264,7 @@ save-plot:
 	@:
 
 release-mode:
-	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
 		$(SERVICE) $(RELEASE_SCRIPT)
 
 preflight-slow-height:
