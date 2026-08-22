@@ -446,6 +446,45 @@ It does **not** call `StopMove()`, `ReleaseMode()`, `SelectMode()`, or publish
 the four-wheel confirmation because those occur only after controlled STANDARD
 has been reached during a confirmed live run.
 
+## Manual initial-pose preparation in Release Mode
+
+Use the dedicated Release Mode command when the operator needs to arrange the
+known good initial pose by hand before a height or roll run:
+
+```bash
+make release-mode
+```
+
+The command verifies `eth0 = 192.168.123.18`, initializes DDS domain 0, checks
+the active motion service, and requires `rt/lowcmd` to remain quiet. If Sport is
+active, it requires the typed phrase below, calls `StopMove()`, repeatedly calls
+`ReleaseMode()`, and requires `CheckMode()` to report no active service:
+
+```text
+RELEASE GO2W FOR MANUAL POSITIONING
+```
+
+This command never creates or writes a `LowCmd` publisher. Release Mode alone
+is therefore not a low-level joint controller: it removes the active motion
+service and intentionally leaves posture and balance control inactive after
+the process exits. Before confirming, support the body against dropping or
+pinching, block all wheels, keep hands clear, and keep the hardware E-stop
+ready. Move the joints manually only after the terminal prints
+`RELEASE MODE READY`, and keep the robot supported throughout preparation.
+
+Once the known initial pose is ready, run the corresponding read-only preflight
+and then the intended height or roll live command. Those gesture scripts accept
+an already-released service state, re-check the stable initial pose and quiet
+`rt/lowcmd`, and then take LowCmd ownership. If preparation is abandoned, do
+not assume Sport stabilization has returned; this command deliberately does not
+guess or restore a motion-service name.
+
+Inspect the exact release sequence without opening DDS:
+
+```bash
+make describe-release-mode
+```
+
 ## Live hardware execution
 
 Do not continue unless the selected preflight succeeds and the physical safety

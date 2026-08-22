@@ -2,6 +2,7 @@ COMPOSE := docker compose
 SERVICE := controller
 PYTHON := /opt/venv/bin/python
 SLOW_SCRIPT := /app/go2w_gesture_real.py
+RELEASE_SCRIPT := /app/go2w_enter_release_mode.py
 FAST_SCRIPT := /app/go2w_gesture_real_fast.py
 NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_no_tracking_stop.py
 FAST_NO_TRACKING_STOP_SCRIPT := /app/go2w_gesture_real_fast_no_tracking_stop.py
@@ -27,7 +28,7 @@ ifneq ($(filter save-plot,$(MAKECMDGOALS)),)
 SIM_RUN_ARGS += --save-plot
 endif
 
-.PHONY: help build test pip-check clean describe \
+.PHONY: help build test pip-check clean describe describe-release-mode release-mode \
 	describe-slow describe-slow-height describe-slow-roll \
 	describe-fast describe-fast-height describe-fast-roll \
 	describe-no-tracking-stop describe-no-tracking-stop-height describe-no-tracking-stop-roll \
@@ -61,6 +62,7 @@ endif
 
 help:
 	@echo "Non-hardware: make build | test | describe"
+	@echo "Manual initial-pose setup: make describe-release-mode | release-mode"
 	@echo "Slow 2.0/2.0 read-only: make preflight-slow-height | preflight-slow-roll"
 	@echo "Slow 2.0/2.0 physical:  make live-slow-height | live-slow-roll"
 	@echo "Fast 1.0/0.5 read-only: make preflight-fast-height | preflight-fast-roll"
@@ -89,6 +91,10 @@ build:
 	$(COMPOSE) build --pull
 
 describe: describe-slow describe-fast describe-no-tracking-stop describe-fast-no-tracking-stop
+
+describe-release-mode:
+	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
+		$(SERVICE) $(RELEASE_SCRIPT) --describe
 
 describe-slow:
 	$(COMPOSE) run --rm --no-deps -T --entrypoint $(PYTHON) \
@@ -256,6 +262,10 @@ sim-view-wbc-roll:
 
 save-plot:
 	@:
+
+release-mode:
+	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
+		$(SERVICE) $(RELEASE_SCRIPT)
 
 preflight-slow-height:
 	$(COMPOSE) run --rm --no-deps --entrypoint $(PYTHON) \
