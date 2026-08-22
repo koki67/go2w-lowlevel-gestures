@@ -10,7 +10,6 @@ WBC_SCRIPT := /app/go2w_gesture_real_wbc.py
 QUALIFIER := qualification/go2w_qualify_live.py
 HOST_PYTHON ?= python3
 TRACKING_LOG_DIR ?= runs
-QUALIFIED_SHA ?=
 QUALIFY_ARGS ?=
 UNITREE_MUJOCO_ROOT ?= $(abspath ../unitree_mujoco)
 UNITREE_MUJOCO_PYTHON ?= $(UNITREE_MUJOCO_ROOT)/simulate_python/.venv/bin/python
@@ -74,7 +73,7 @@ help:
 	@echo "Adaptive fast physical:  make live-adaptive-height | live-adaptive-roll"
 	@echo "Quasi-static WBC read-only: make preflight-wbc-height | preflight-wbc-roll"
 	@echo "Quasi-static WBC physical:  make live-wbc-height | live-wbc-roll"
-	@echo "Jetson qualification: make qualify-live-adaptive-height QUALIFIED_SHA=<sha> (and the other 3 cases)"
+	@echo "Jetson qualification: make qualify-live-adaptive-height (and the other 3 cases)"
 	@echo "Compatibility: preflight-height/roll and live-height/roll use slow"
 	@echo "MuJoCo requirement check: make sim-doctor"
 	@echo "MuJoCo runs: make sim-height | sim-roll | sim-quick-stand | sim-shake-off"
@@ -364,19 +363,19 @@ live-wbc-roll:
 
 qualify-live-adaptive-height:
 	$(HOST_PYTHON) $(QUALIFIER) --controller adaptive --gesture height \
-		--expected-sha '$(QUALIFIED_SHA)' --live $(QUALIFY_ARGS)
+		--live $(QUALIFY_ARGS)
 
 qualify-live-adaptive-roll:
 	$(HOST_PYTHON) $(QUALIFIER) --controller adaptive --gesture roll \
-		--expected-sha '$(QUALIFIED_SHA)' --live $(QUALIFY_ARGS)
+		--live $(QUALIFY_ARGS)
 
 qualify-live-wbc-height:
 	$(HOST_PYTHON) $(QUALIFIER) --controller wbc --gesture height \
-		--expected-sha '$(QUALIFIED_SHA)' --live $(QUALIFY_ARGS)
+		--live $(QUALIFY_ARGS)
 
 qualify-live-wbc-roll:
 	$(HOST_PYTHON) $(QUALIFIER) --controller wbc --gesture roll \
-		--expected-sha '$(QUALIFIED_SHA)' --live $(QUALIFY_ARGS)
+		--live $(QUALIFY_ARGS)
 
 live-height: live-slow-height
 

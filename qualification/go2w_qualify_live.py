@@ -139,7 +139,7 @@ def capture(command: Iterable[str]) -> str:
     return completed.stdout.strip()
 
 
-def check_repository(expected_sha: Optional[str], expected_branch: str) -> tuple[str, str]:
+def check_repository(expected_branch: str) -> tuple[str, str]:
     status = capture(("git", "status", "--porcelain", "--untracked-files=normal"))
     if status:
         raise QualificationFailure(
@@ -155,26 +155,21 @@ def check_repository(expected_sha: Optional[str], expected_branch: str) -> tuple
                 branch, expected_branch
             )
         )
-    if expected_sha and sha != expected_sha:
+    remote_ref = "refs/remotes/origin/{}".format(expected_branch)
+    try:
+        remote_sha = capture(("git", "rev-parse", remote_ref))
+    except subprocess.CalledProcessError as error:
         raise QualificationFailure(
-            "Git SHA mismatch: current {}, expected {}".format(sha, expected_sha)
-        )
-    if expected_sha:
-        remote_ref = "refs/remotes/origin/{}".format(expected_branch)
-        try:
-            remote_sha = capture(("git", "rev-parse", remote_ref))
-        except subprocess.CalledProcessError as error:
-            raise QualificationFailure(
-                "remote-tracking ref {} is unavailable; fetch without modifying dirty work first".format(
-                    remote_ref
-                )
-            ) from error
-        if remote_sha != expected_sha:
-            raise QualificationFailure(
-                "remote-tracking SHA mismatch: {} is {}, expected {}".format(
-                    remote_ref, remote_sha, expected_sha
-                )
+            "remote-tracking ref {} is unavailable; update main before qualification".format(
+                remote_ref
             )
+        ) from error
+    if remote_sha != sha:
+        raise QualificationFailure(
+            "remote-tracking SHA mismatch: HEAD is {}, {} is {}; update main before qualification".format(
+                sha, remote_ref, remote_sha
+            )
+        )
     return branch, sha
 
 
@@ -240,7 +235,6 @@ def parse_args(argv=None):
     )
     parser.add_argument("--controller", choices=CONTROLLERS, required=True)
     parser.add_argument("--gesture", choices=GESTURES, required=True)
-    parser.add_argument("--expected-sha")
     parser.add_argument("--expected-branch", default=EXPECTED_BRANCH)
     parser.add_argument("--interface", default=DEFAULT_INTERFACE)
     parser.add_argument("--expected-ip", default=DEFAULT_EXPECTED_IP)
@@ -265,11 +259,7 @@ def main(argv=None) -> int:
     actual_ip = None
     software_preflight_pass = False
     try:
-        if args.live and not args.expected_sha:
-            raise QualificationFailure(
-                "--live requires --expected-sha from the desktop-qualified commit"
-            )
-        branch, sha = check_repository(args.expected_sha, args.expected_branch)
+        branch, sha = check_repository(args.expected_branch)
         run.emit("[ok] clean Git state: {} {}".format(branch, sha))
         actual_ip = check_platform_and_network(args.interface, args.expected_ip)
         run.emit(
@@ -353,7 +343,9 @@ def main(argv=None) -> int:
             "exit_code": exit_code,
             "git_branch": branch,
             "git_sha": sha,
-            "expected_sha": args.expected_sha,
+            "remote_tracking_ref": "refs/remotes/origin/{}".format(
+                args.expected_branch
+            ),
             "architecture": platform.machine(),
             "interface": args.interface,
             "actual_ip": actual_ip,

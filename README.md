@@ -535,31 +535,29 @@ be part of the command and is shown in the live precheck output.
 
 ## Jetson qualification runner
 
-The four `qualify-live-*` targets fail closed on a dirty worktree, wrong branch
-or SHA, non-`aarch64` host, NIC/IP mismatch, build failure, test failure,
-`pip check` failure, describe failure, or read-only preflight failure. They do
+The four `qualify-live-*` targets fail closed on a dirty worktree, wrong branch,
+`HEAD`/`origin/main` mismatch, non-`aarch64` host, NIC/IP mismatch, build failure,
+test failure, `pip check` failure, describe failure, or read-only preflight failure. They do
 not stash, reset, delete, retry, select another gesture, or invoke a
 no-tracking-stop fallback.
 
-The qualification runner now expects the published `main` branch. On the
-Jetson, fetch and fast-forward `main`, build it, and record the exact 40-character
-SHA before starting a live case:
+The qualification runner expects the published `main` branch. It automatically
+checks that the worktree is clean and that `HEAD` exactly matches
+`origin/main`, then performs the build, tests, dependency check, description,
+and read-only preflight. No manual SHA variable is required:
 
 ```bash
 cd /home/unitree/go2w-lowlevel-gestures
-git fetch --prune origin
 git switch main
 git pull --ff-only origin main
-make build
-QUALIFIED_SHA=$(git rev-parse HEAD)
 ```
 
 For WBC-only physical evaluation, run height first and review its artifacts
 before proceeding to roll:
 
 ```bash
-make qualify-live-wbc-height QUALIFIED_SHA="$QUALIFIED_SHA"
-make qualify-live-wbc-roll QUALIFIED_SHA="$QUALIFIED_SHA"
+make qualify-live-wbc-height
+make qualify-live-wbc-roll
 ```
 
 Both WBC cases use the same operator-selected stable initial pose. This
@@ -570,10 +568,10 @@ The same runner also supports the complete adaptive/WBC sequence when that is
 the intended campaign:
 
 ```bash
-make qualify-live-adaptive-height QUALIFIED_SHA="$QUALIFIED_SHA"
-make qualify-live-adaptive-roll QUALIFIED_SHA="$QUALIFIED_SHA"
-make qualify-live-wbc-height QUALIFIED_SHA="$QUALIFIED_SHA"
-make qualify-live-wbc-roll QUALIFIED_SHA="$QUALIFIED_SHA"
+make qualify-live-adaptive-height
+make qualify-live-adaptive-roll
+make qualify-live-wbc-height
+make qualify-live-wbc-roll
 ```
 
 Before each live child starts, the runner prints a Japanese physical checklist

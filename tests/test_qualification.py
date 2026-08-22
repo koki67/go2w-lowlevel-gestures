@@ -28,6 +28,7 @@ class QualificationRunnerTests(unittest.TestCase):
 
         self.assertEqual(qualifier.EXPECTED_BRANCH, "main")
         self.assertEqual(args.expected_branch, "main")
+        self.assertFalse(hasattr(args, "expected_sha"))
 
     def common_patches(self):
         return (
@@ -122,26 +123,6 @@ class QualificationRunnerTests(unittest.TestCase):
             self.assertEqual(seen, ["build", "tests"])
             self.assertIn("tests failed", self.latest_summary(output_root)["error"])
 
-    def test_live_requires_desktop_sha_before_any_stage(self):
-        with tempfile.TemporaryDirectory() as output_root:
-            with mock.patch.object(
-                qualifier.QualificationRun, "run_command", autospec=True
-            ) as run_stage:
-                exit_code = qualifier.main(
-                    [
-                        "--controller",
-                        "adaptive",
-                        "--gesture",
-                        "roll",
-                        "--output-root",
-                        output_root,
-                        "--live",
-                    ]
-                )
-            self.assertEqual(exit_code, 1)
-            run_stage.assert_not_called()
-            self.assertIn("requires --expected-sha", self.latest_summary(output_root)["error"])
-
     def test_wrong_confirmation_never_invokes_live_target(self):
         with tempfile.TemporaryDirectory() as output_root:
             seen = []
@@ -168,8 +149,6 @@ class QualificationRunnerTests(unittest.TestCase):
                         "wbc",
                         "--gesture",
                         "height",
-                        "--expected-sha",
-                        SHA,
                         "--output-root",
                         output_root,
                         "--live",
@@ -211,8 +190,6 @@ class QualificationRunnerTests(unittest.TestCase):
                         "wbc",
                         "--gesture",
                         "roll",
-                        "--expected-sha",
-                        SHA,
                         "--output-root",
                         output_root,
                         "--live",
@@ -230,6 +207,10 @@ class QualificationRunnerTests(unittest.TestCase):
             self.assertTrue(kwargs["interactive_output"])
             self.assertFalse(any("no-tracking-stop" in part for part in command))
             summary = self.latest_summary(output_root)
+            self.assertNotIn("expected_sha", summary)
+            self.assertEqual(
+                summary["remote_tracking_ref"], "refs/remotes/origin/main"
+            )
             self.assertEqual(
                 summary["physical_initial_pose_scope"],
                 "single-proven-stable-four-wheel-loaded-belly-clear",
@@ -241,12 +222,12 @@ class QualificationRunnerTests(unittest.TestCase):
             qualifier, "capture", return_value=" M important.py"
         ) as capture:
             with self.assertRaisesRegex(qualifier.QualificationFailure, "dirty"):
-                qualifier.check_repository(SHA, qualifier.EXPECTED_BRANCH)
+                qualifier.check_repository(qualifier.EXPECTED_BRANCH)
         capture.assert_called_once_with(
             ("git", "status", "--porcelain", "--untracked-files=normal")
         )
 
-    def test_remote_tracking_sha_must_match_desktop_qualified_sha(self):
+    def test_remote_tracking_sha_must_match_current_head(self):
         with mock.patch.object(
             qualifier,
             "capture",
@@ -255,7 +236,7 @@ class QualificationRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 qualifier.QualificationFailure, "remote-tracking SHA mismatch"
             ):
-                qualifier.check_repository(SHA, qualifier.EXPECTED_BRANCH)
+                qualifier.check_repository(qualifier.EXPECTED_BRANCH)
 
 
 if __name__ == "__main__":
