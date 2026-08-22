@@ -24,10 +24,11 @@ external dependency; they are not vendored into this repository.
 | `go2w_gesture_real_wbc.py` | quasi-static kinematic WBC | 1.0 s nominal | 0.5 s minimum | Adaptive envelopes plus 0.55 rad stop |
 
 Every live gesture shares the same control-ownership checks, captured-prone
-shutdown, explicit confirmation boundary, and conditional Sport Mode
-restoration. The diagnostic variant disables only the joint tracking-error
-stop; LowState freshness, finite-state, body-tilt, DDS-write, and ownership
-watchdogs remain active.
+shutdown, and conditional Sport Mode restoration. The fast no-tracking-stop
+profile starts automatically after those live prechecks; the other profiles
+retain the explicit confirmation boundary. The diagnostic variant disables
+only the joint tracking-error stop; LowState freshness, finite-state,
+body-tilt, DDS-write, and ownership watchdogs remain active.
 
 ## Clone, build, and inspect
 
@@ -467,6 +468,12 @@ make live-fast-no-tracking-stop-height
 make live-fast-no-tracking-stop-roll
 ```
 
+These two fast no-tracking-stop targets do not prompt for `RUN GO2W ...`.
+After the NIC/IP, DDS, active-service, stable-prone, and runtime-state prechecks
+pass, they proceed directly to the Sport/LowCmd ownership handoff and motion.
+Keep the wheels blocked, support/spotter in place, and hardware E-stop ready
+before running either `make` command.
+
 Closed-loop live targets exist explicitly, but the first physical evaluation
 must use the qualification runner in the next section:
 
@@ -477,8 +484,8 @@ make live-wbc-height
 make live-wbc-roll
 ```
 
-The required typed confirmation depends on the gesture, not the timing
-profile. Height:
+All other live targets require a typed confirmation. The phrase depends on the
+gesture. Height:
 
 ```text
 RUN GO2W LOW LEVEL
@@ -493,7 +500,8 @@ RUN GO2W ROLL LOW LEVEL
 The live ownership sequence is common to both gestures:
 
 1. Confirm a stable, belly-down measured pose.
-2. Require the gesture-specific interactive phrase.
+2. Require the gesture-specific interactive phrase, except for the two
+   `live-fast-no-tracking-stop-*` targets, which start automatically.
 3. If `CheckMode()` reported an active Sport service, save its exact name, send
    Sport `StopMove()`, and repeatedly call `ReleaseMode()` plus `CheckMode()`
    until it is inactive. Any nonzero release result aborts before LowCmd starts.
@@ -510,7 +518,7 @@ The live ownership sequence is common to both gestures:
     startup service name and require `CheckMode()` to confirm it.
 
 There is intentionally no ambiguous `make live` target. The gesture name must
-be part of the command and is shown again before confirmation.
+be part of the command and is shown in the live precheck output.
 
 ## Jetson qualification runner
 
@@ -600,8 +608,10 @@ fast diagnostic variants for runs where tracking-error telemetry must not
 terminate the gesture. They still print throttled warnings above `0.45 rad`
 and record all 12 leg joints, but never stop solely because the
 target-minus-measured joint error is large. The independent `0.55 rad` body
-roll/pitch watchdog remains enabled. Their live confirmation explicitly
-reports `tracking-error stop disabled`.
+roll/pitch watchdog remains enabled. Their live precheck explicitly reports
+`tracking-error stop disabled`. The fast variant does not wait for a typed
+confirmation after that precheck; the slow variant retains the
+gesture-specific confirmation.
 
 The pinned Unitree SDK2Py API accepts and publishes the requested `q`, `dq`,
 `kp`, `kd`, and `tau` fields. Unitree's public SDK examples do not document an

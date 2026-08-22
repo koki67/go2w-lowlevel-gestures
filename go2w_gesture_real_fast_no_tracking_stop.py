@@ -4,6 +4,8 @@
 The repeated gesture transitions take 1.0 s and holds take 0.5 s. The 0.45 rad
 warning and complete tracking telemetry remain enabled. All other runtime
 watchdogs and the normal LowCmd/Sport Mode ownership handling are unchanged.
+After the live prechecks pass, this dedicated profile starts without waiting
+for a typed confirmation phrase.
 """
 
 from __future__ import print_function
@@ -17,6 +19,7 @@ def main(argv=None):
         argv,
         timing=FAST_TIMING,
         tracking_stop_rad=None,
+        require_live_confirmation=False,
     )
 
 

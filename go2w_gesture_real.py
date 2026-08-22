@@ -2,7 +2,9 @@
 """Run slow-profile Go2W low-level gestures through Unitree SDK2Py.
 
 The default invocation is a read-only preflight. Physical motion requires the
-explicit ``--live`` flag and a confirmation phrase entered on a TTY.
+explicit ``--live`` flag. Profiles require a confirmation phrase entered on a
+TTY unless their dedicated wrapper explicitly opts into automatic start after
+the live prechecks pass.
 
 After a confirmed return to the captured prone pose, the live sequence sends a
 neutral zero-gain command, closes its LowCmd writer, waits for the topic to
@@ -604,6 +606,7 @@ class HardwareGestureController:
         timing=SLOW_TIMING,
         tracking_log_dir=None,
         tracking_stop_rad=RUN_MAX_TRACKING_ERROR_RAD,
+        require_live_confirmation=True,
     ):
         if gesture not in GESTURE_NAMES:
             raise ValueError("unknown gesture: {!r}".format(gesture))
@@ -621,6 +624,7 @@ class HardwareGestureController:
         self.timing = timing
         self.tracking_log_dir = tracking_log_dir
         self.tracking_stop_rad = tracking_stop_rad
+        self.require_live_confirmation = bool(require_live_confirmation)
         self._lock = threading.Lock()
         self._samples = deque(maxlen=2000)
         self._last_lowcmd_time = None  # type: Optional[float]
@@ -1386,7 +1390,7 @@ class HardwareGestureController:
         self._lowcmd_subscriber = lowcmd_subscriber
 
     def _confirm_live(self, mode_form, mode_name, prone_pose, rpy):
-        if not sys.stdin.isatty():
+        if self.require_live_confirmation and not sys.stdin.isatty():
             raise RuntimeError("--live requires an interactive TTY confirmation")
         print("\nLIVE HARDWARE PRECHECK PASSED", flush=True)
         print("  selected gesture: {}".format(self.gesture), flush=True)
@@ -1447,13 +1451,20 @@ class HardwareGestureController:
             "a support/spotter is present, and the hardware E-stop is held ready.",
             flush=True,
         )
-        confirmation = LIVE_CONFIRMATIONS[self.gesture]
-        entered = input(
-            "Type {!r} to take LowCmd ownership and move: ".format(confirmation)
-        )
-        if entered.strip() != confirmation:
-            raise RuntimeError(
-                "live confirmation did not match; LowCmd ownership was not changed"
+        if self.require_live_confirmation:
+            confirmation = LIVE_CONFIRMATIONS[self.gesture]
+            entered = input(
+                "Type {!r} to take LowCmd ownership and move: ".format(confirmation)
+            )
+            if entered.strip() != confirmation:
+                raise RuntimeError(
+                    "live confirmation did not match; LowCmd ownership was not changed"
+                )
+        else:
+            print(
+                "  live confirmation input: not required for this profile; "
+                "starting automatically",
+                flush=True,
             )
         if self._stop_requested.is_set():
             raise InterruptedSequence()
@@ -1534,7 +1545,7 @@ class HardwareGestureController:
                 flush=True,
             )
 
-        # Re-measure after confirmation (and after StopMove when Sport was
+        # Re-measure after the live gate (and after StopMove when Sport was
         # active) so shutdown uses the actual stable pose immediately before
         # this process takes LowCmd ownership.
         self._captured_prone, _rpy = self._capture_stable_prone()
@@ -1634,8 +1645,8 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
             "Go2W real-hardware low-level gestures. Default execution is a "
-            "read-only preflight; physical motion requires --live plus an "
-            "interactive gesture-specific confirmation."
+            "read-only preflight; physical motion requires --live. Most "
+            "profiles also require an interactive gesture-specific confirmation."
         )
     )
     parser.add_argument(
@@ -1656,7 +1667,7 @@ def parse_args(argv):
     parser.add_argument(
         "--live",
         action="store_true",
-        help="allow Sport release and physical LowCmd motion after TTY confirmation",
+        help="allow Sport release and physical LowCmd motion after live prechecks",
     )
     parser.add_argument(
         "--tracking-log-dir",
@@ -1681,6 +1692,7 @@ def main(
     controller_class=None,
     sequence_printer=print_sequence_plan,
     controller_kwargs=None,
+    require_live_confirmation=True,
 ):
     if not isinstance(timing, GestureTimingProfile):
         raise ValueError("invalid timing profile: {!r}".format(timing))
@@ -1721,6 +1733,7 @@ def main(
             timing=timing,
             tracking_log_dir=args.tracking_log_dir,
             tracking_stop_rad=tracking_stop_rad,
+            require_live_confirmation=require_live_confirmation,
             **extra_controller_kwargs
         )
         signal.signal(signal.SIGINT, controller.request_stop)

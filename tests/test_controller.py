@@ -678,7 +678,48 @@ class ControllerTests(unittest.TestCase):
             ["--describe"],
             timing=controller_module.FAST_TIMING,
             tracking_stop_rad=None,
+            require_live_confirmation=False,
         )
+
+    def test_fast_no_tracking_stop_live_gate_does_not_read_confirmation(self):
+        for gesture in ("height", "roll"):
+            with self.subTest(gesture=gesture):
+                controller = controller_module.HardwareGestureController(
+                    "eth0",
+                    "192.168.123.18",
+                    gesture,
+                    timing=controller_module.FAST_TIMING,
+                    tracking_stop_rad=None,
+                    require_live_confirmation=False,
+                )
+
+                with mock.patch.object(
+                    controller_module.sys.stdin, "isatty", return_value=False
+                ), mock.patch("builtins.input") as confirmation_input:
+                    controller._confirm_live(
+                        "1",
+                        "ai-w",
+                        list(PRONE),
+                        [0.0, 0.0, 0.0],
+                    )
+
+                confirmation_input.assert_not_called()
+
+    def test_other_profiles_still_require_an_interactive_confirmation(self):
+        controller = controller_module.HardwareGestureController(
+            "eth0", "192.168.123.18", "roll"
+        )
+
+        with mock.patch.object(
+            controller_module.sys.stdin, "isatty", return_value=False
+        ):
+            with self.assertRaisesRegex(RuntimeError, "interactive TTY confirmation"):
+                controller._confirm_live(
+                    "1",
+                    "ai-w",
+                    list(PRONE),
+                    [0.0, 0.0, 0.0],
+                )
 
     def test_fast_profile_applies_to_height_and_roll_cycles(self):
         for gesture in ("height", "roll"):
